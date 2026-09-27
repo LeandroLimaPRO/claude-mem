@@ -563,13 +563,17 @@ export class ClaudeProvider {
           // always pending while a batch is re-queued, so the buffer never
           // idles out, and an endlessly failing turn would spin on it.
           if (!turnDispatchedText) {
-            if (resultIsError && !retriedAfterErrorResult) {
+            if (resultIsError) {
+              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+              if (retriedAfterErrorResult) {
+                session.abortReason = 'transport:empty_sdk_result';
+                break;
+              }
               retriedAfterErrorResult = true;
               logger.warn('SDK', 'SDK turn failed before emitting text, re-queueing the claimed batch', {
                 sessionId: session.sessionDbId,
                 subtype: resultSubtype,
               });
-              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
             } else {
               await processAgentResponse(
                 '',
