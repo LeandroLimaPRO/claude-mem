@@ -109,6 +109,16 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       expect(status.status).toBe('cooldown');
     });
 
+    it('waits for the preferred model when automatic fallback is disabled', () => {
+      const model = 'gemini-flash-latest';
+      tracker.setAutoFallback(false);
+      tracker.setCooldown(model, 60_000, 'test');
+      const selection = tracker.selectBestAvailableModel(model, 100);
+      expect(selection.selectedModel.id).toBe(model);
+      expect(selection.willFallback).toBe(false);
+      expect(selection.waitMs).toBeGreaterThan(59_000);
+    });
+
     it('marks models with 404 as unsupported', () => {
       const model = 'gemini-retired-model';
       tracker.recordRequestFailure(model, 404, 'models/gemini-retired-model not found');

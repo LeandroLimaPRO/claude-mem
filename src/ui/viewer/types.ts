@@ -78,6 +78,7 @@ export interface GeminiRateLimitsStatus {
   provider: 'gemini';
   activeModel: string;
   autoFallback: boolean;
+  tier?: 'free' | 'payg';
   models: Record<string, ModelUsageState>;
   cascade: GeminiModelInfo[];
   queue: {

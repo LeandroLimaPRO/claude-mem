@@ -44,6 +44,7 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
       }),
       getSessionStore: () => ({
         getPromptNumberFromUserPrompts: () => 1,
+        getLatestPromptTextFromUserPrompts: () => 'test prompt',
       }),
     } as unknown as DatabaseManager;
 
@@ -137,4 +138,3 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     expect(sessionManager.getSession(104)).toBeDefined();
   });
 });
-

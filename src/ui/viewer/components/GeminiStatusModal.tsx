@@ -101,7 +101,11 @@ export function GeminiStatusModal({
   const handleRefreshClick = async () => {
     setIsRefreshing(true);
     try {
+      const response = await fetch('/api/gemini/refresh', { method: 'POST' });
+      if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
       await onRefresh();
+    } catch (err) {
+      console.error('Failed to rediscover models', err);
     } finally {
       setIsRefreshing(false);
     }

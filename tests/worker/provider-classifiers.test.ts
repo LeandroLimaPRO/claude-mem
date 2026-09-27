@@ -75,6 +75,15 @@ describe('classifyGeminiError', () => {
     expect(err.kind).toBe('auth_invalid');
   });
 
+  it('keeps explicit minute quotas retryable and daily quotas exhausted', () => {
+    expect(classifyGeminiError({ status: 429, bodyText: 'quota exceeded per minute', cause: null }).kind)
+      .toBe('rate_limit');
+    expect(classifyGeminiError({ status: 429, bodyText: 'RESOURCE_EXHAUSTED daily', cause: null }).kind)
+      .toBe('quota_exhausted');
+    expect(classifyGeminiError({ status: 503, bodyText: 'model is overloaded', cause: null }).kind)
+      .toBe('model_overloaded');
+  });
+
   it('classifies 403 PERMISSION_DENIED as auth_invalid', () => {
     const err = classifyGeminiError({
       status: 403,

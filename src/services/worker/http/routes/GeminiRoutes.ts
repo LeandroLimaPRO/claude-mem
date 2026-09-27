@@ -5,6 +5,8 @@ import { DynamicModelRegistry } from '../../gemini/DynamicModelRegistry.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { paths } from '../../../../shared/paths.js';
 import { getCredential } from '../../../../shared/EnvManager.js';
+import { existsSync } from 'fs';
+import { readJsonFileWithBom, writeJsonFileAtomic } from '../../../../shared/atomic-json.js';
 
 export class GeminiRoutes extends BaseRouteHandler {
   constructor() {
@@ -38,6 +40,17 @@ export class GeminiRoutes extends BaseRouteHandler {
   private handleSelectModel = this.wrapHandler((req: Request, res: Response): void => {
     const { model, autoFallback } = req.body ?? {};
     const tracker = RateLimitTracker.getInstance();
+    const updates: Record<string, string> = {};
+    if (typeof model === 'string' && model) updates.CLAUDE_MEM_GEMINI_MODEL = model;
+    if (typeof autoFallback === 'boolean') updates.CLAUDE_MEM_GEMINI_AUTO_FALLBACK = String(autoFallback);
+    if (Object.keys(updates).length > 0) {
+      const settingsPath = paths.settings();
+      const settings = existsSync(settingsPath) ? readJsonFileWithBom<Record<string, any>>(settingsPath) : {};
+      const nested = settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env);
+      writeJsonFileAtomic(settingsPath, nested
+        ? { ...settings, env: { ...settings.env, ...updates } }
+        : { ...settings, ...updates });
+    }
 
     if (typeof model === 'string' && model) {
       tracker.setActiveModel(model);

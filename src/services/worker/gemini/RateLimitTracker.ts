@@ -388,6 +388,9 @@ export class RateLimitTracker {
       if (check.allowed) {
         return { selectedModel: candidate, willFallback: false, waitMs: 0 };
       }
+      if (!this.autoFallbackEnabled) {
+        return { selectedModel: candidate, willFallback: false, waitMs: check.waitMs, reason: check.reason };
+      }
     }
 
     // If auto-fallback is enabled, cascade through remaining models in rank order

@@ -29,6 +29,7 @@ export type Component =
   | 'DEDUP'
   | 'ENV'
   | 'FOLDER_INDEX'
+  | 'GEMINI'
   | 'GIT'
   | 'GROK_INDEX'
   | 'HOOK'
