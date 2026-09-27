@@ -52,7 +52,7 @@ export class DynamicModelRegistry {
    */
   public async discoverModels(apiKey: string, force: boolean = false): Promise<GeminiModelInfo[]> {
     if (!apiKey) {
-      logger.warn('GEMINI', 'Cannot discover models: No API key provided');
+      logger.warn('SDK', 'Cannot discover models: No API key provided');
       return this.cascade;
     }
 
@@ -68,7 +68,7 @@ export class DynamicModelRegistry {
 
     this.isDiscovering = true;
     try {
-      logger.info('GEMINI', 'Discovering available Gemini models from Google AI Studio API...');
+      logger.info('SDK', 'Discovering available Gemini models from Google AI Studio API...');
       const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
       const response = await fetch(url, {
         method: 'GET',
@@ -77,13 +77,13 @@ export class DynamicModelRegistry {
       });
 
       if (!response.ok) {
-        logger.warn('GEMINI', `Model discovery API returned status ${response.status}; using baseline cascade`);
+        logger.warn('SDK', `Model discovery API returned status ${response.status}; using baseline cascade`);
         return this.cascade;
       }
 
       const data = await response.json() as ModelsApiResponse;
       if (!data.models || !Array.isArray(data.models)) {
-        logger.warn('GEMINI', 'Model discovery API returned unexpected payload; using baseline cascade');
+        logger.warn('SDK', 'Model discovery API returned unexpected payload; using baseline cascade');
         return this.cascade;
       }
 
@@ -160,14 +160,14 @@ export class DynamicModelRegistry {
       this.cascade = discoveredCascade;
       this.lastDiscoveredAt = now;
 
-      logger.info('GEMINI', `Successfully discovered ${discoveredCascade.length} text generation models`, {
+      logger.info('SDK', `Successfully discovered ${discoveredCascade.length} text generation models`, {
         topModel: discoveredCascade[0]?.id,
         totalModels: discoveredCascade.length
       });
 
       return this.cascade;
     } catch (err: unknown) {
-      logger.warn('GEMINI', 'Dynamic model discovery failed (network/timeout); falling back to default cascade', {
+      logger.warn('SDK', 'Dynamic model discovery failed (network/timeout); falling back to default cascade', {
         error: err instanceof Error ? err.message : String(err)
       });
       return this.cascade;

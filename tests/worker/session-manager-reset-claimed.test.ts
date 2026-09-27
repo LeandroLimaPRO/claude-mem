@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { SessionManager } from '../../src/services/worker/SessionManager.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { PendingMessage, PendingMessageWithId } from '../../src/services/worker-types.js';
@@ -44,10 +44,15 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
       }),
       getSessionStore: () => ({
         getPromptNumberFromUserPrompts: () => 1,
+        getLatestPromptTextFromUserPrompts: () => null,
       }),
     } as unknown as DatabaseManager;
 
     sessionManager = new SessionManager(mockDbManager);
+  });
+
+  afterEach(async () => {
+    await sessionManager.shutdownAll();
   });
 
   it('exposes resetClaimed as a valid function alias of resetProcessingToPending', () => {
@@ -137,4 +142,3 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     expect(sessionManager.getSession(104)).toBeDefined();
   });
 });
-
