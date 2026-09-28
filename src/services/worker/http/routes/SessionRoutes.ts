@@ -415,11 +415,21 @@ export class SessionRoutes extends BaseRouteHandler {
           });
         }
 
+        // Preserve transport errors only for retryable kinds; unrecoverable errors
+        // (model_incompatible, unknown_bad_request, etc.) should finalize immediately
+        const isTransient = isClassified(error) && (
+          error.kind === 'transient' ||
+          error.kind === 'rate_limit' ||
+          error.kind === 'quota_exhausted' ||
+          error.kind === 'model_overloaded'
+        );
         session.abortReason = isClassified(error) && error.kind === 'auth_invalid'
           ? 'auth:provider_failure'
           : isClassified(error) && error.kind === 'quota_exhausted'
             ? 'quota:provider_failure'
-            : 'transport:provider_failure';
+            : isTransient
+              ? 'transport:provider_failure'
+              : null;
 
         if (isClassified(error)) {
           logger.error('SESSION', 'Observer failed', {
