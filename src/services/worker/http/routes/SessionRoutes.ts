@@ -417,7 +417,7 @@ export class SessionRoutes extends BaseRouteHandler {
 
         session.abortReason = isClassified(error) && error.kind === 'auth_invalid'
           ? 'auth:provider_failure'
-          : isClassified(error) && (error.kind === 'quota_exhausted' || error.kind === 'rate_limit')
+          : isClassified(error) && error.kind === 'quota_exhausted'
             ? 'quota:provider_failure'
             : 'transport:provider_failure';
 

@@ -706,11 +706,13 @@ describe('SessionStore migrations', () => {
     try {
       db.run('PRAGMA busy_timeout = 0');
       db.run('PRAGMA foreign_keys = OFF');
+      db.run('PRAGMA temp_store = FILE');
 
       new SessionStore(db);
 
       expect((db.query('PRAGMA busy_timeout').get() as { timeout: number }).timeout).toBe(SQLITE_BUSY_TIMEOUT_MS);
       expect((db.query('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys).toBe(1);
+      expect((db.query('PRAGMA temp_store').get() as { temp_store: number }).temp_store).toBe(1);
       expect((db.query('PRAGMA synchronous').get() as { synchronous: number }).synchronous).toBe(1);
       expect((db.query('PRAGMA journal_size_limit').get() as { journal_size_limit: number }).journal_size_limit)
         .toBe(SQLITE_JOURNAL_SIZE_LIMIT_BYTES);

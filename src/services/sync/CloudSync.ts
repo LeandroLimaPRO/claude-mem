@@ -1992,7 +1992,7 @@ export class CloudSync {
 
   private scheduleRetry(minDelayMs = 0): void {
     if (this.stopped || this.retryTimer) return;
-    const delay = applyBackoffJitter(Math.max(this.nextBackoffMs, minDelayMs));
+    const delay = Math.max(minDelayMs, applyBackoffJitter(this.nextBackoffMs));
     this.nextBackoffMs = Math.min(this.nextBackoffMs * 2, this.backoffMaxMs);
     const timer = setTimeout(() => {
       this.retryTimer = null;

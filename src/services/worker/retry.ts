@@ -45,6 +45,8 @@ export interface RetryOptions {
   label?: string;
   /** External abort signal. */
   abortSignal?: AbortSignal;
+  /** Admission before the request deadline starts; runs again for each HTTP retry. */
+  beforeAttempt?: (signal?: AbortSignal) => Promise<void>;
 }
 
 /** Bounds shared with the other CLAUDE_MEM_*_TIMEOUT_MS settings. */
@@ -93,7 +95,7 @@ export function resolveLlmTimeoutMs(
   return FALLBACK_PER_ATTEMPT_TIMEOUT_MS;
 }
 
-const DEFAULT_OPTIONS: Required<Omit<RetryOptions, 'label' | 'abortSignal' | 'perAttemptTimeoutMs'>> = {
+const DEFAULT_OPTIONS: Required<Omit<RetryOptions, 'label' | 'abortSignal' | 'perAttemptTimeoutMs' | 'beforeAttempt'>> = {
   maxRetries: 2,
   baseDelayMs: 100,
   maxDelayMs: 30_000,
@@ -136,6 +138,8 @@ export async function withRetry<T>(
       throw new Error('Aborted');
     }
 
+    await options.beforeAttempt?.(options.abortSignal);
+
     // Per-attempt timeout via AbortController. Forward external aborts too.
     const attemptController = new AbortController();
     let deadlineExpired = false;
@@ -145,6 +149,7 @@ export async function withRetry<T>(
     }, opts.perAttemptTimeoutMs);
     const onExternalAbort = () => attemptController.abort();
     options.abortSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    if (options.abortSignal?.aborted) onExternalAbort();
 
     try {
       return await fn(attemptController.signal);

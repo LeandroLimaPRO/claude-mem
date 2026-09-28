@@ -17,6 +17,7 @@ interface RawGeminiApiModel {
 
 interface ModelsApiResponse {
   models?: RawGeminiApiModel[];
+  nextPageToken?: string;
 }
 
 export class DynamicModelRegistry {
@@ -43,14 +44,10 @@ export class DynamicModelRegistry {
       ?? DEFAULT_MODEL_CASCADE.find(m => m.id === modelId);
   }
 
-  public getLastDiscoveredAt(): number {
-    return this.lastDiscoveredAt;
-  }
-
   /**
    * Discover and rank available models from Google AI Studio API for the given key.
    */
-  public async discoverModels(apiKey: string, force: boolean = false): Promise<GeminiModelInfo[]> {
+  public async discoverModels(apiKey: string, force: boolean = false, surfaceFailure: boolean = false): Promise<GeminiModelInfo[]> {
     if (!apiKey) {
       logger.warn('SDK', 'Cannot discover models: No API key provided');
       return this.cascade;
@@ -69,27 +66,33 @@ export class DynamicModelRegistry {
     this.isDiscovering = true;
     try {
       logger.info('SDK', 'Discovering available Gemini models from Google AI Studio API...');
-      const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(10000)
+      const allModels: RawGeminiApiModel[] = [];
+      const seenTokens = new Set<string>();
+      let pageToken: string | undefined;
+      do {
+        const url = new URL('https://generativelanguage.googleapis.com/v1beta/models');
+        url.searchParams.set('key', apiKey);
+        if (pageToken) url.searchParams.set('pageToken', pageToken);
+        const response = await fetch(url.toString(), {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json() as ModelsApiResponse;
+        if (!Array.isArray(data.models)) throw new Error('Invalid model list payload');
+        allModels.push(...data.models);
+        pageToken = data.nextPageToken;
+        if (pageToken && seenTokens.has(pageToken)) throw new Error('Repeated model list page token');
+        if (pageToken) seenTokens.add(pageToken);
+      } while (pageToken);
+
+      const textModels = allModels.filter(m => {
+        const id = m.name?.match(/^models\/([A-Za-z0-9][A-Za-z0-9._-]*)$/)?.[1];
+        return id && !/(?:^|[-_])(image|tts)(?:$|[-_])/i.test(id) &&
+          m.supportedGenerationMethods?.includes('generateContent');
       });
-
-      if (!response.ok) {
-        logger.warn('SDK', `Model discovery API returned status ${response.status}; using baseline cascade`);
-        return this.cascade;
-      }
-
-      const data = await response.json() as ModelsApiResponse;
-      if (!data.models || !Array.isArray(data.models)) {
-        logger.warn('SDK', 'Model discovery API returned unexpected payload; using baseline cascade');
-        return this.cascade;
-      }
-
-      const textModels = data.models.filter(m =>
-        m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent')
-      );
+      if (textModels.length === 0) return this.cascade;
 
       const discoveredCascade: GeminiModelInfo[] = [];
 
@@ -167,9 +170,10 @@ export class DynamicModelRegistry {
 
       return this.cascade;
     } catch (err: unknown) {
-      logger.warn('SDK', 'Dynamic model discovery failed (network/timeout); falling back to default cascade', {
-        error: err instanceof Error ? err.message : String(err)
+      logger.warn('SDK', 'Dynamic model discovery failed; retaining current catalog', {
+        errorType: err instanceof Error ? err.name : 'unknown',
       });
+      if (surfaceFailure) throw err;
       return this.cascade;
     } finally {
       this.isDiscovering = false;

@@ -13,6 +13,8 @@ import { RateLimitTracker } from './gemini/RateLimitTracker.js';
 import { DynamicModelRegistry } from './gemini/DynamicModelRegistry.js';
 import { GeminiStatusBroadcaster } from './gemini/GeminiStatusBroadcaster.js';
 import { DEFAULT_MODEL_CASCADE } from './gemini/model-cascade.js';
+import { setTimeout as sleep } from 'node:timers/promises';
+import type { TokenReservation } from './gemini/types.js';
 
 // v1beta is required: the current Gemini 3.x models, Gemma models, and the Google-maintained
 // `-latest` aliases are exposed under v1beta.
@@ -42,7 +44,9 @@ export function classifyGeminiError(input: {
 
   // Distinguish daily/total quota from minute-level rate limits
   if (lower.includes('quota exceeded') || lower.includes('resource_exhausted')) {
-    if (lower.includes('per day') || lower.includes('daily') || lower.includes('rpd')) {
+    const minuteQuota = /per[ _]?minute|\brpm\b|\btpm\b/.test(lower);
+    if (lower.includes('per day') || lower.includes('daily') || lower.includes('rpd') ||
+        (lower.includes('quota exceeded') && !minuteQuota)) {
       return new ClassifiedProviderError(
         `Gemini daily quota exhausted${status !== undefined ? ` (status ${status})` : ''}`,
         { kind: 'quota_exhausted', cause },
@@ -76,7 +80,7 @@ export function classifyGeminiError(input: {
       lower.includes('waitlist')
     ) {
       return new ClassifiedProviderError(
-        `Gemini model restricted (status ${status}): ${body}`,
+        `Gemini model restricted (status ${status})`,
         { kind: 'model_restricted', cause },
       );
     }
@@ -88,7 +92,7 @@ export function classifyGeminiError(input: {
 
   if (status === 422 || lower.includes('unprocessable')) {
     return new ClassifiedProviderError(
-      `Gemini unprocessable entity (422): ${body}`,
+      'Gemini unprocessable entity (422)',
       { kind: 'model_incompatible', cause },
     );
   }
@@ -106,9 +110,9 @@ export function classifyGeminiError(input: {
     );
   }
 
-  if (status === 503 || lower.includes('model is overloaded') || lower.includes('overloaded')) {
+  if (lower.includes('overloaded')) {
     return new ClassifiedProviderError(
-      `Gemini model overloaded (status ${status ?? 503}): ${body}`,
+      `Gemini model overloaded (status ${status ?? 503})`,
       { kind: 'model_overloaded', cause, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
     );
   }
@@ -213,6 +217,7 @@ interface GeminiContent {
 export interface GeminiConfig {
   apiKey: string;
   model: string;
+  configuredModel?: string;
   rateLimitingEnabled: boolean;
   autoFallback: boolean;
 }
@@ -292,7 +297,13 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
   }
 
   protected async query(history: ConversationMessage[], config: GeminiConfig, signal?: AbortSignal): Promise<ProviderQueryResult> {
-    return this.executeWithDynamicCascade(history, config, signal);
+    const latest = this.getGeminiConfig();
+    return this.executeWithDynamicCascade(history, {
+      ...config,
+      model: config.model === (config.configuredModel ?? config.model) ? latest.model : config.model,
+      rateLimitingEnabled: latest.rateLimitingEnabled,
+      autoFallback: latest.autoFallback,
+    }, signal);
   }
 
   private fetchGenerateContent(
@@ -322,6 +333,38 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
    * Execute request with dynamic rate limiting, predictive demotion,
    * reactive fallback on 429, and automatic promotion when capacity frees up.
    */
+  private async waitForReservation(preferredModel: string, estimatedTokens: number, signal?: AbortSignal): Promise<{
+    modelId: string; reservation: TokenReservation;
+  }> {
+    let waiting = false;
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        const selection = this.tracker.selectBestAvailableModel(preferredModel, estimatedTokens);
+        const admission = selection.waitMs > 0
+          ? { reservation: undefined, waitMs: selection.waitMs, reason: selection.reason }
+          : this.tracker.tryReserve(selection.selectedModel.id, estimatedTokens);
+        if (admission.reservation) return { modelId: selection.selectedModel.id, reservation: admission.reservation };
+        if (!Number.isFinite(admission.waitMs) || admission.waitMs <= 0) {
+          throw new ClassifiedProviderError('No usable Gemini quota is available', { kind: 'unrecoverable', cause: null });
+        }
+        if (!waiting) {
+          this.tracker.beginQuotaWait(admission.waitMs);
+          waiting = true;
+        } else {
+          this.tracker.updateQueueState({ quotaWaitRemainingMs: admission.waitMs });
+        }
+        const waitMs = Math.min(60_000, admission.waitMs);
+        GeminiStatusBroadcaster.getInstance().broadcastQueuePaused(Math.ceil(admission.waitMs / 1000), admission.reason ?? 'rate_limit');
+        await sleep(waitMs, undefined, { signal });
+      }
+    } finally {
+      if (waiting) {
+        if (this.tracker.endQuotaWait()) GeminiStatusBroadcaster.getInstance().broadcastQueueResumed();
+      }
+    }
+  }
+
   private async executeWithDynamicCascade(
     history: ConversationMessage[],
     config: GeminiConfig,
@@ -331,47 +374,36 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const estimatedTokens = Math.max(100, Math.ceil(totalChars / 4));
     const contents = this.conversationToGeminiContents(history);
 
-    const maxAttempts = config.autoFallback ? 4 : 1;
+    const attemptedModels = new Set<string>();
     let currentModelId = config.model;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // Predictive selection: check capacity of preferred model vs cascade
-      let targetModelId = currentModelId;
-      if (config.rateLimitingEnabled) {
-        const selection = this.tracker.selectBestAvailableModel(currentModelId, estimatedTokens);
-        targetModelId = selection.selectedModel.id;
-
-        if (selection.waitMs > 0) {
-          const waitSec = Math.ceil(selection.waitMs / 1000);
-          logger.info('SDK', `All models rate-limited; pausing queue for ${waitSec}s...`, {
-            model: targetModelId,
-            waitMs: selection.waitMs
-          });
-          this.tracker.updateQueueState({ isWaitingForQuota: true, quotaWaitRemainingMs: selection.waitMs });
-          GeminiStatusBroadcaster.getInstance().broadcastQueuePaused(waitSec, selection.reason ?? 'rate_limit');
-
-          await new Promise(resolve => setTimeout(resolve, Math.min(60_000, selection.waitMs)));
-
-          this.tracker.updateQueueState({ isWaitingForQuota: false, quotaWaitRemainingMs: 0 });
-          GeminiStatusBroadcaster.getInstance().broadcastQueueResumed();
-        }
-      }
-
-      logger.debug('SDK', `Querying Gemini dynamic cascade (model: ${targetModelId}, attempt: ${attempt})`, {
-        turns: history.length,
-        totalChars,
-        estimatedTokens
-      });
-
-      const url = `${GEMINI_API_URL}/${targetModelId}:generateContent?key=${config.apiKey}`;
+    let targetModelId = currentModelId;
       let priorRequestId: string | null = null;
-
+    while (true) {
+      signal?.throwIfAborted();
+      let reservation: TokenReservation | undefined;
       try {
         const data = await withRetry<GeminiResponse>(async (attemptSignal) => {
+          let sent = false;
+          let parsed: GeminiResponse | undefined;
+          try {
           let response: Response;
           try {
+            if (!config.rateLimitingEnabled) {
+              targetModelId = currentModelId === 'auto' ? this.registry.getCascade()[0]?.id ?? '' : currentModelId;
+              if (!this.registry.getModel(targetModelId)) {
+                throw new ClassifiedProviderError(`Unknown Gemini model: ${targetModelId}`, { kind: 'unrecoverable', cause: null });
+              }
+            }
+            if (attemptedModels.has(targetModelId)) {
+              throw new ClassifiedProviderError('Gemini cascade repeated a rejected model', { kind: 'unrecoverable', cause: null });
+            }
+            const url = `${GEMINI_API_URL}/${encodeURIComponent(targetModelId)}:generateContent?key=${config.apiKey}`;
+            attemptSignal.throwIfAborted();
+            sent = true;
             response = await this.fetchGenerateContent(url, contents, priorRequestId, attemptSignal);
           } catch (networkError: unknown) {
+            if (networkError instanceof ClassifiedProviderError) throw networkError;
+            if (attemptSignal.aborted) throw networkError;
             const err = networkError instanceof Error ? networkError : new Error(String(networkError));
             throw classifyGeminiError({ cause: err });
           }
@@ -421,7 +453,9 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
               );
 
               if (failureAnalysis.fallbackRecommended && failureAnalysis.nextModel) {
-                const fallbackErr = new Error(`FALLBACK_TO_${failureAnalysis.nextModel.id}`);
+                const fallbackErr = new ClassifiedProviderError(`FALLBACK_TO_${failureAnalysis.nextModel.id}`, {
+                  kind: 'model_fallback', cause: classified,
+                });
                 (fallbackErr as any).isFallback = true;
                 (fallbackErr as any).nextModelId = failureAnalysis.nextModel.id;
                 (fallbackErr as any).reason = failureAnalysis.reason ?? 'Cascaded to next model';
@@ -433,8 +467,23 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             throw classified;
           }
 
-          return await response.json() as GeminiResponse;
-        }, { label: `Gemini ${targetModelId}` });
+          parsed = await response.json() as GeminiResponse;
+          return parsed;
+          } finally {
+            if (reservation) {
+              this.tracker.reconcileReservation(reservation, parsed?.usageMetadata?.promptTokenCount, sent, !!parsed);
+              reservation = undefined;
+            }
+          }
+        }, {
+          label: `Gemini ${targetModelId}`,
+          abortSignal: signal,
+          beforeAttempt: config.rateLimitingEnabled ? async waitSignal => {
+            const admission = await this.waitForReservation(currentModelId, estimatedTokens, waitSignal);
+            targetModelId = admission.modelId;
+            reservation = admission.reservation;
+          } : undefined,
+        });
 
         const finishReason = (data as any)?.candidates?.[0]?.finishReason;
         const promptFeedback = (data as any)?.promptFeedback;
@@ -463,9 +512,6 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
         const content = textContent;
         const tokensUsed = data.usageMetadata?.totalTokenCount ?? estimatedTokens;
 
-        // Record real token usage and successful request in tracker
-        this.tracker.recordRequestSuccess(targetModelId, tokensUsed);
-
         return {
           content,
           tokensUsed,
@@ -486,7 +532,8 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             fallbackReason
           );
           currentModelId = nextModel;
-          if (attempt === maxAttempts) {
+          attemptedModels.add(targetModelId);
+          if (attemptedModels.has(nextModel)) {
             throw lastErr;
           }
           continue; // Retry with next model
@@ -496,7 +543,6 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
       }
     }
 
-    throw new Error('Gemini cascade exhausted all available models without success.');
   }
 
   private getGeminiConfig(): GeminiConfig {
@@ -516,11 +562,8 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const autoFallback = (settings as any).CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'false';
 
     this.tracker.setAutoFallback(autoFallback);
-    if (configuredModel !== 'auto') {
-      this.tracker.setActiveModel(configuredModel);
-    }
 
-    return { apiKey, model: configuredModel, rateLimitingEnabled, autoFallback };
+    return { apiKey, model: configuredModel, configuredModel, rateLimitingEnabled, autoFallback };
   }
 }
 

@@ -28,7 +28,7 @@ async function drainAll(sessionManager: SessionManager, sessionDbId: number): Pr
   return collected;
 }
 
-describe('SessionManager.resetClaimed and generator recovery', () => {
+describe('SessionManager.resetProcessingToPending and generator recovery', () => {
   let sessionManager: SessionManager;
   let mockDbManager: DatabaseManager;
   const sessionDbId = 999;
@@ -55,12 +55,11 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     await sessionManager.shutdownAll();
   });
 
-  it('exposes resetClaimed as a valid function alias of resetProcessingToPending', () => {
-    expect(typeof sessionManager.resetClaimed).toBe('function');
+  it('exposes resetProcessingToPending', () => {
     expect(typeof sessionManager.resetProcessingToPending).toBe('function');
   });
 
-  it('resets claimed messages so they can be re-drained via resetClaimed', async () => {
+  it('resets claimed messages so they can be re-drained', async () => {
     const buffer = sessionManager.getMessageBuffer();
     buffer.enqueue(sessionDbId, obs('Read', 'tool-1'));
     buffer.enqueue(sessionDbId, obs('Write', 'tool-2'));
@@ -73,8 +72,7 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     const emptyDrain = await drainAll(sessionManager, sessionDbId);
     expect(emptyDrain.length).toBe(0);
 
-    // Call resetClaimed to release claimed messages back to pending
-    const resetCount = await sessionManager.resetClaimed(sessionDbId);
+    const resetCount = await sessionManager.resetProcessingToPending(sessionDbId);
     expect(resetCount).toBe(2);
 
     // Now draining yields both messages again
@@ -83,7 +81,7 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     expect(reDrained.map(m => m.tool_name)).toEqual(['Read', 'Write']);
   });
 
-  it('behaves identically between resetProcessingToPending and resetClaimed', async () => {
+  it('resets processing messages to pending', async () => {
     const buffer = sessionManager.getMessageBuffer();
     buffer.enqueue(sessionDbId, obs('Bash', 'tool-3'));
 
@@ -98,11 +96,11 @@ describe('SessionManager.resetClaimed and generator recovery', () => {
     expect(reDrained[0].tool_name).toBe('Bash');
   });
 
-  it('clears session claimedMessageIds when resetClaimed is called on an active session', async () => {
+  it('clears session claimedMessageIds on an active session', async () => {
     const session = sessionManager.initializeSession(sessionDbId, 'test prompt', 1, 'test-project');
     session.claimedMessageIds = [101, 102];
 
-    await sessionManager.resetClaimed(sessionDbId);
+    await sessionManager.resetProcessingToPending(sessionDbId);
 
     expect(session.claimedMessageIds).toEqual([]);
   });

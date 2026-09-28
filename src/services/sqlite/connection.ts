@@ -3,7 +3,7 @@ import { logger } from '../../utils/logger.js';
 
 export const SQLITE_BUSY_TIMEOUT_MS = 5000;
 export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 4194304;
-export const SQLITE_CACHE_SIZE_PAGES = -4000; // Cap cache to ~4MB to prevent unbounded memory growth
+export const SQLITE_CACHE_SIZE_PAGES = -4000; // Approximately 4 MB for SQLite's page cache; not a total process memory limit
 
 type DatabaseOptions = NonNullable<ConstructorParameters<typeof Database>[1]>;
 
@@ -47,7 +47,6 @@ export function applySqliteConnectionPragmas(
   runRequiredPragma(db, 'PRAGMA synchronous = NORMAL', 'synchronous');
   runRequiredPragma(db, `PRAGMA journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`, 'journal_size_limit');
   runRequiredPragma(db, `PRAGMA cache_size = ${SQLITE_CACHE_SIZE_PAGES}`, 'cache_size');
-  runRequiredPragma(db, 'PRAGMA temp_store = MEMORY', 'temp_store');
 
   if (enableIncrementalAutoVacuum && !hasUserTables(db)) {
     runRequiredPragma(db, 'PRAGMA auto_vacuum = INCREMENTAL', 'auto_vacuum');

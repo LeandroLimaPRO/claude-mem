@@ -121,7 +121,7 @@
   <a href="#-fork-adjustments--features">Fork Features</a> •
   <a href="#-installation--setup-guide">Installation</a> •
   <a href="#-system-architecture">Architecture</a> •
-  <a href="#-overlay-automation--update-immunity">Overlay Automation</a> •
+  <a href="#3-versioned-fork-build">Build & Install</a> •
   <a href="#quick-start">Upstream Quick Start</a> •
   <a href="#how-it-works">How It Works</a> •
   <a href="#mcp-search-tools">Search Tools</a> •
@@ -137,12 +137,11 @@
 
 ## ⚡ Enhanced Fork: Gemini Dynamic Engine & Antigravity Edition
 
-> **A custom fork engineered for multi-agent workflows, native Antigravity CLI (`agy`) support, intelligent Gemini Rate-Limiting & Quota Management, and zero-downtime auto-update overlay immunity.**
+> **A custom fork engineered for multi-agent workflows, native Antigravity CLI (`agy`) support, intelligent Gemini Rate-Limiting & Quota Management, and versioned fork builds.**
 
 <p align="center">
   <img src="https://img.shields.io/badge/Fork_Edition-Antigravity_%2B_Gemini_Engine-0284c7?style=for-the-badge&logo=google" alt="Antigravity Edition" />
   <img src="https://img.shields.io/badge/Gemini_Rate_Limiter-Dynamic_%26_Adaptive-8250df?style=for-the-badge&logo=googlegemini" alt="Gemini Dynamic Engine" />
-  <img src="https://img.shields.io/badge/Overlay_Protection-Auto--Update_Immunity-10b981?style=for-the-badge&logo=powershell" alt="Overlay Protected" />
 </p>
 
 ---
@@ -152,7 +151,7 @@
 #### 1. 🧠 Gemini Dynamic Engine & Adaptive Rate Limiter
 - **Header Status Badge:** Interactive badge in the Web Viewer header displaying current active model, live RPM limits, token consumption, and dynamic cooldown statuses.
 - **Visual Cooldown Indicator (`is-paused`):** Pulsating visual indicator in the UI during `quota_exhausted` states with precise countdown timer until resume.
-- **Fail-Safe Observation Queue:** When Google Gemini rate limits are hit, observations are preserved safely in an in-memory & SQLite buffer without dropping events or crashing the worker.
+- **Observation Queue:** When Gemini rate limits are hit, pending observations stay in the worker's in-memory queue while the process remains alive.
 - **Cascading Failure Mitigation:** Intelligent exponential backoff preventing API hammering during upstream provider quota limits.
 
 #### 2. 🪐 First-Class Antigravity CLI (`agy`) Integration
@@ -160,13 +159,8 @@
 - **Dedicated Tag Styles & Visual Accents:** Distinct visual badges (`.source-antigravity-cli`) with modern sky-blue accents in both light and dark modes.
 - **Cross-Agent Memory Context:** Seamlessly preserves and surfaces tool observations across Claude Code, Antigravity CLI, and Codex within the same project.
 
-#### 3. 🛡️ Custom Overlay Architecture (Auto-Update Immunity)
-Claude Code's plugin manager automatically wipes cache folders (`~/.claude/plugins/cache/thedotmack/claude-mem/<version>`) when upstream releases new versions. This fork solves that with a **persistent overlay system**:
-- **Persistent Overlay Store:** Custom files, typography, and SQLite patches are stored in `~/.claude-mem/custom-overlay/`.
-- **1-Click Restore Scripts:**
-  - `apply-overlay.cmd` (Windows double-click launcher)
-  - `apply-overlay.ps1` (Automated PowerShell script with auto-detection of active version from `installed_plugins.json`)
-- **Safety Pre-Backups:** Automatically backs up clean upstream files to `.backup-before-overlay` before injecting patches.
+#### 3. Versioned Fork Build
+Build this fork from a chosen tag or commit. Plugin updates require building and installing that version again; local edits to a plugin cache are not preserved by updates.
 
 #### 4. 🎨 Modernized Web Viewer UI
 - **Refined Typography:** Bundled with `Monaspace Radon` custom fonts for optimal legibility of code snippets and memory diffs.
@@ -177,19 +171,15 @@ Claude Code's plugin manager automatically wipes cache folders (`~/.claude/plugi
 
 ### 📦 Installation & Setup Guide
 
-#### Option A: Quick Install via 1-Click Custom Overlay (Recommended)
-If you already have Claude-Mem installed or want to stay compatible with upstream releases:
-1. Ensure the overlay files exist in `~/.claude-mem/custom-overlay/`.
-2. Run the restore script anytime after an update:
-   ```cmd
-   # Via Command Prompt / Explorer:
-   C:\Users\<User>\.claude-mem\custom-overlay\apply-overlay.cmd
-   ```
-   Or via PowerShell:
-   ```powershell
-   powershell.exe -ExecutionPolicy Bypass -File "C:\Users\<User>\.claude-mem\custom-overlay\apply-overlay.ps1"
-   ```
-3. The script automatically detects the active installed version in `installed_plugins.json`, creates a backup, and re-injects the custom interface and Antigravity drivers.
+#### Option A: Build a Selected Fork Version
+```bash
+git clone <your-fork-url> claude-mem
+cd claude-mem
+git checkout <tag-or-commit>
+npm ci
+npm run build
+```
+Then register the fork marketplace and install the plugin using Option B below.
 
 #### Option B: Installing This Fork into Claude Code Marketplace
 To point Claude Code directly to this fork:
@@ -252,11 +242,6 @@ flowchart TD
         DB[("SQLite Database + Chroma Vector DB")]
     end
 
-    subgraph Protection ["Overlay Persistence System"]
-        OVR["~/.claude-mem/custom-overlay/"]
-        SCR["apply-overlay.ps1 / .cmd"]
-        ACT["Active Cache (~/.claude/plugins/cache/.../)"]
-    end
 
     subgraph UI ["Modern Web Viewer"]
         VW["viewer.html (95KB Enhanced UI)"]
@@ -272,10 +257,8 @@ flowchart TD
     H --> SS
     SS --> DB
     GDE --> DB
+    GDE --> VW
 
-    OVR -->|1-Click Injection| SCR
-    SCR -->|Overlays Patches| ACT
-    ACT --> VW
 
     VW --> BDG
     VW --> MONO
@@ -300,11 +283,6 @@ flowchart TD
   This indicates a temporary `quota_exhausted` cooldown on your AI provider (e.g., Gemini API free tier rate limits).  
   > **Important:** Do **NOT** restart the worker service. Restarting resets the exponential backoff counter and sends redundant requests. Incoming observations stay safely queued and will automatically be written as soon as the timer expires.
 
-- **Claude Code updated and my custom UI disappeared!**  
-  Simply run `apply-overlay.cmd` (or `apply-overlay.ps1`) located at `~/.claude-mem/custom-overlay/`. It will restore all enhancements in seconds.
-
-- **How do I check worker health?**  
-  Open `http://127.0.0.1:37777/api/gemini/status` in your browser or run `curl http://127.0.0.1:37777/api/gemini/status`.
 
 ---
 

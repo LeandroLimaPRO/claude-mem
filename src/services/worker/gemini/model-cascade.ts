@@ -327,8 +327,7 @@ export interface TierRateLimits {
 
 /**
  * Return effective rate limits based on user tier:
- * - 'free': Official Google AI Studio Free Tier limits
- * - 'payg': Official Google Cloud / AI Studio Pay-As-You-Go (Tier 1) limits
+ * - 'free' and 'payg': local estimates; actual project limits may differ
  */
 export function getTierLimits(model: GeminiModelInfo, tier: 'free' | 'payg'): TierRateLimits {
   if (tier === 'free') {

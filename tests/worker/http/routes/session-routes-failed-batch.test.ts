@@ -1,8 +1,10 @@
 import { describe, it, expect, mock } from 'bun:test';
 import { SessionRoutes } from '../../../../src/services/worker/http/routes/SessionRoutes.js';
 import type { ActiveSession } from '../../../../src/services/worker-types.js';
+import { ClassifiedProviderError } from '../../../../src/services/worker/provider-errors.js';
+import { getQuotaCooldown, resetQuotaCooldownsForTesting } from '../../../../src/shared/quota-cooldown.js';
 
-function harness(fail: boolean) {
+function harness(fail: boolean, failure: Error = new Error('simulated provider failure')) {
   let pending = 0;
   let failuresRemaining = fail ? 1 : 0;
   const session = {
@@ -30,12 +32,12 @@ function harness(fail: boolean) {
     removeSessionImmediate,
   };
   const startSession = mock(async () => {
-    if (failuresRemaining-- > 0) throw new Error('simulated provider failure');
+    if (failuresRemaining-- > 0) throw failure;
     pending = 0;
   });
   const routes = new SessionRoutes(
     sessionManager as never, {} as never, { startSession } as never,
-    {} as never, {} as never, {} as never, {} as never,
+    { startSession } as never, {} as never, {} as never, {} as never,
     { finalizeSession } as never,
   );
   return { routes, session, startSession, resetProcessingToPending, finalizeSession, removeSessionImmediate, pending: () => pending };
@@ -64,5 +66,19 @@ describe('SessionRoutes failed batch lifecycle', () => {
     await h.session.generatorPromise;
     expect(h.finalizeSession).toHaveBeenCalledWith(4147);
     expect(h.removeSessionImmediate).toHaveBeenCalledWith(4147);
+  });
+
+  it('keeps minute-limited work without arming the 30-minute allowance breaker', async () => {
+    resetQuotaCooldownsForTesting();
+    try {
+      const error = new ClassifiedProviderError('HTTP 429', { kind: 'rate_limit', cause: null });
+      const h = harness(true, error);
+      await (h.routes as any).startGeneratorWithProvider(h.session, 'gemini', 'test', null);
+      await h.session.generatorPromise;
+      expect(h.pending()).toBe(1);
+      expect(getQuotaCooldown('gemini')).toBeNull();
+    } finally {
+      resetQuotaCooldownsForTesting();
+    }
   });
 });

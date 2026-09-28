@@ -7,6 +7,9 @@ import { DatabaseManager } from '../src/services/worker/DatabaseManager';
 import { SessionManager } from '../src/services/worker/SessionManager';
 import { ModeManager } from '../src/services/domain/ModeManager';
 import { SettingsDefaultsManager } from '../src/shared/SettingsDefaultsManager';
+import { RateLimitTracker } from '../src/services/worker/gemini/RateLimitTracker';
+import { DynamicModelRegistry } from '../src/services/worker/gemini/DynamicModelRegistry';
+import * as timers from 'node:timers/promises';
 
 let rateLimitingEnabled = 'false';
 let queuedMessages: Array<Record<string, unknown>> = [];
@@ -217,6 +220,22 @@ describe('GeminiProvider', () => {
     const url = (global.fetch as any).mock.calls[0][0];
     expect(url).toContain('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent');
     expect(url).toContain('key=test-api-key');
+  });
+
+  it('applies a saved model change on the next query of an open session', async () => {
+    const originalConfig = (agent as any).getConfig();
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-3.1-pro-preview',
+      CLAUDE_MEM_GEMINI_AUTO_FALLBACK: 'false',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+    }));
+    mockSuccessfulGeminiFetch();
+
+    await (agent as any).query([{ role: 'user', content: 'observe this' }], originalConfig);
+
+    expect((global.fetch as any).mock.calls[0][0]).toContain('/models/gemini-3.1-pro-preview:generateContent');
   });
 
   it('should handle multi-turn conversation', async () => {
@@ -494,10 +513,18 @@ describe('GeminiProvider', () => {
 
   it('should respect rate limits when rate limiting enabled', async () => {
     rateLimitingEnabled = 'true';
-
-    const originalSetTimeout = global.setTimeout;
-    const mockSetTimeout = mock((cb: any) => cb());
-    global.setTimeout = mockSetTimeout as any;
+    const tracker = RateLimitTracker.getInstance();
+    tracker.resetAllCounters();
+    let now = Date.now();
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    const waits: number[] = [];
+    const sleep = spyOn(timers, 'setTimeout').mockImplementation((async (ms: number) => {
+      waits.push(ms);
+      now += ms;
+    }) as any);
+    for (const model of DynamicModelRegistry.getInstance().getCascade()) {
+      tracker.setCooldown(model.id, 60_000, 'test');
+    }
 
     try {
       const session = {
@@ -523,9 +550,11 @@ describe('GeminiProvider', () => {
       await agent.startSession(session);
       await agent.startSession(session);
 
-      expect(mockSetTimeout).toHaveBeenCalled();
+      expect(waits).toEqual([60_000]);
     } finally {
-      global.setTimeout = originalSetTimeout;
+      sleep.mockRestore();
+      clock.mockRestore();
+      tracker.resetAllCounters();
     }
   });
 

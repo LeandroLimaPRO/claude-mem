@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { ClassifiedProviderError } from '../../src/services/worker/provider-errors.js';
-import { isRetryableKind } from '../../src/services/worker/retry.js';
+import { isRetryableKind, withRetry } from '../../src/services/worker/retry.js';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 // Pins the retry policy: quota/auth/unrecoverable errors must fail fast (no
 // pointless retries of something that cannot succeed); transient and
@@ -35,4 +36,20 @@ describe('isRetryableKind', () => {
     });
     expect(isRetryableKind(err)).toBe(false);
   });
+});
+
+it('starts the request deadline after quota admission', async () => {
+  let admitted = false;
+  const result = await withRetry(async signal => {
+    signal.throwIfAborted();
+    return admitted;
+  }, {
+    maxRetries: 0,
+    perAttemptTimeoutMs: 20,
+    beforeAttempt: async () => {
+      await sleep(60);
+      admitted = true;
+    },
+  });
+  expect(result).toBe(true);
 });
