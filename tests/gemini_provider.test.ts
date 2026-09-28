@@ -360,6 +360,19 @@ describe('GeminiProvider', () => {
     expect(session.cumulativeInputTokens).toBeGreaterThan(0);
   });
 
+  it('forwards session.abortController.signal into every query() call so cancellation reaches an in-flight admission wait', async () => {
+    const session = makeSession({});
+    queuedMessages = [toolObservationMessage];
+    const querySpy = spyOn(agent as any, 'query').mockResolvedValue({ content: 'ok', tokensUsed: 10 });
+
+    await agent.startSession(session);
+
+    // init call, then one observation call.
+    expect(querySpy).toHaveBeenCalledTimes(2);
+    expect(querySpy.mock.calls[0][2]).toBe(session.abortController.signal);
+    expect(querySpy.mock.calls[1][2]).toBe(session.abortController.signal);
+  });
+
   it('stores a deferred observation response under the original prompt project after the live session advances', async () => {
     const session = makeSession({
       project: 'repo-a',
