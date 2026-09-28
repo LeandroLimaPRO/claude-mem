@@ -6,7 +6,7 @@
 // in-temp-dir SessionStore over an in-memory DB, injected fetchImpl, fast
 // debounce/backoff.
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -1711,6 +1711,24 @@ describe('CloudSync', () => {
     await sleep(2_000);
     expect(call).toBeGreaterThanOrEqual(2);
     sync.stop();
+  });
+
+  it('never applies jitter below Retry-After', async () => {
+    seedObservation();
+    let calls = 0;
+    const random = spyOn(Math, 'random').mockReturnValue(0);
+    const sync = makeCloudSync((async () => {
+      calls++;
+      return new Response('rate limited', { status: 429, headers: { 'Retry-After': '1' } });
+    }) as typeof fetch, {}, { backoffInitialMs: 20, debounceMs: 10 });
+    try {
+      await sync.flush();
+      await sleep(900);
+      expect(calls).toBe(1);
+    } finally {
+      sync.stop();
+      random.mockRestore();
+    }
   });
 
   it('stop() mid-flight halts stamping, further DB access, and retry re-arming', async () => {

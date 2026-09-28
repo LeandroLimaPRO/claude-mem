@@ -222,6 +222,22 @@ describe('GeminiProvider', () => {
     expect(url).toContain('key=test-api-key');
   });
 
+  it('applies a saved model change on the next query of an open session', async () => {
+    const originalConfig = (agent as any).getConfig();
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-3.1-pro-preview',
+      CLAUDE_MEM_GEMINI_AUTO_FALLBACK: 'false',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
+    }));
+    mockSuccessfulGeminiFetch();
+
+    await (agent as any).query([{ role: 'user', content: 'observe this' }], originalConfig);
+
+    expect((global.fetch as any).mock.calls[0][0]).toContain('/models/gemini-3.1-pro-preview:generateContent');
+  });
+
   it('should handle multi-turn conversation', async () => {
     const session = {
       sessionDbId: 1,

@@ -72,7 +72,12 @@ class Bucket(unittest.TestCase):
     def test_weekly_bucket_covers_window(self):
         w = self.window("2026-09-22", "2026-09-24")                         # Tue-Wed PT, inside the UTC week of Mon 21 Sep
         b = measure.bucket_rule(self.measured(dt.datetime(2026, 9, 25, 12, 0, tzinfo=UTC)), w)
-        self.assertEqual((b["bucket"], b["usd"], b["covers_window"]), ("usage_weekly", 42.25, True)); self.assertIn("week Mon 21 Sep", b["label"]); self.assertIsNone(b["note"])
+        self.assertEqual((b["bucket"], b["usd"], b["covers_window"]), ("usage_weekly", 42.25, True)); self.assertIn("week Mon 21 Sep", b["label"])
+        self.assertFalse(b["matches_window"])
+        report = dict(window=w, spend=dict(agent_estimated_usd=1.0))
+        measure.apply(report, self.measured(dt.datetime(2026, 9, 25, 12, 0, tzinfo=UTC)))
+        self.assertIsNone(report["spend"]["agent_measured_usd"])
+        self.assertEqual(report["spend"]["measured_reference"]["usd"], 42.25)
 
     def test_window_not_finished_is_reference_only(self):
         w = self.window("2026-09-22", "2026-09-27")                         # ends after "now"
@@ -100,8 +105,16 @@ class Bucket(unittest.TestCase):
         for li in d["line_items"]: self.assertEqual(li["cost_basis"] in ("estimated_usage", "extrapolated"), True)
         fetched = dt.datetime(2026, 9, 27, 12, 0, tzinfo=UTC)               # Sep month bucket covers the Sep 18-25 window
         measure.apply(d, self.measured(fetched), now=fetched)
-        self.assertEqual((d["spend"]["agent_measured_usd"], d["spend"]["measured_status"]), (99.0, "ok (period bucket)"))
-        h = render.page(d); self.assertGreaterEqual(h.count("MEASURED"), 1); self.assertIn("note-taker calls", h); self.assertIn("$99.00", h)
+        self.assertIsNone(d["spend"]["agent_measured_usd"])
+        h = render.page(d); self.assertIn("note-taker calls", h); self.assertIn("$99.00", h)
+        self.assertNotIn('class="big">$99.00', h)
+
+    def test_exact_snapshot_interval_can_be_measured(self):
+        fetched = dt.datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+        start = dt.datetime(2026, 9, 21, tzinfo=UTC)
+        report = dict(window=dict(start_epoch_ms=int(start.timestamp() * 1000), end_epoch_ms=int(fetched.timestamp() * 1000)), spend=dict(agent_estimated_usd=1.0))
+        result = measure.apply(report, self.measured(fetched))
+        self.assertEqual(result["agent_measured_usd"], 42.25)
 
 
 class SessionScope(unittest.TestCase):

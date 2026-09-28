@@ -5,8 +5,7 @@ import { DynamicModelRegistry } from '../../gemini/DynamicModelRegistry.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { paths } from '../../../../shared/paths.js';
 import { getCredential } from '../../../../shared/EnvManager.js';
-import { existsSync } from 'fs';
-import { readJsonFileWithBom, writeJsonFileAtomic } from '../../../../shared/atomic-json.js';
+import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
 
 export class GeminiRoutes extends BaseRouteHandler {
   constructor() {
@@ -16,55 +15,42 @@ export class GeminiRoutes extends BaseRouteHandler {
   setupRoutes(app: express.Application): void {
     app.get('/api/gemini/status', this.handleGetStatus.bind(this));
     app.post('/api/gemini/refresh', this.handleRefreshModels.bind(this));
-    app.post('/api/gemini/model', this.handleSelectModel.bind(this));
     app.post('/api/gemini/calibrate-rpd', this.handleCalibrateRpd.bind(this));
     app.post('/api/gemini/tier', this.handleSetTier.bind(this));
   }
 
   private handleGetStatus = this.wrapHandler((req: Request, res: Response): void => {
-    const tracker = RateLimitTracker.getInstance();
-    res.json(tracker.getStatus());
+    res.json(RateLimitTracker.getInstance().getStatus());
   });
 
   private handleRefreshModels = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    if (isForeignLoopbackBrowserWrite(req)) {
+      res.status(403).json({ error: 'Gemini writes from a different localhost origin are not allowed' });
+      return;
+    }
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     const apiKey = settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
 
     const registry = DynamicModelRegistry.getInstance();
-    await registry.discoverModels(apiKey, true);
+    try {
+      await registry.discoverModels(apiKey, true, true);
+    } catch {
+      res.status(502).json({ error: 'Gemini model discovery failed; catalog retained' });
+      return;
+    }
 
     const tracker = RateLimitTracker.getInstance();
-    res.json(tracker.getStatus());
-  });
-
-  private handleSelectModel = this.wrapHandler((req: Request, res: Response): void => {
-    const { model, autoFallback } = req.body ?? {};
-    const tracker = RateLimitTracker.getInstance();
-    const updates: Record<string, string> = {};
-    if (typeof model === 'string' && model) updates.CLAUDE_MEM_GEMINI_MODEL = model;
-    if (typeof autoFallback === 'boolean') updates.CLAUDE_MEM_GEMINI_AUTO_FALLBACK = String(autoFallback);
-    if (Object.keys(updates).length > 0) {
-      const settingsPath = paths.settings();
-      const settings = existsSync(settingsPath) ? readJsonFileWithBom<Record<string, any>>(settingsPath) : {};
-      const nested = settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env);
-      writeJsonFileAtomic(settingsPath, nested
-        ? { ...settings, env: { ...settings.env, ...updates } }
-        : { ...settings, ...updates });
-    }
-
-    if (typeof model === 'string' && model) {
-      tracker.setActiveModel(model);
-    }
-    if (typeof autoFallback === 'boolean') {
-      tracker.setAutoFallback(autoFallback);
-    }
-
     res.json(tracker.getStatus());
   });
 
   private handleCalibrateRpd = this.wrapHandler((req: Request, res: Response): void => {
+    if (isForeignLoopbackBrowserWrite(req)) {
+      res.status(403).json({ error: 'Gemini writes from a different localhost origin are not allowed' });
+      return;
+    }
     const { model, count } = req.body ?? {};
-    if (typeof model !== 'string' || typeof count !== 'number' || count < 0) {
+    if (typeof model !== 'string' || !DynamicModelRegistry.getInstance().getCascade().some(m => m.id === model) ||
+        typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
       res.status(400).json({ error: 'Invalid model or count. Expected model: string, count: non-negative number' });
       return;
     }
@@ -74,6 +60,10 @@ export class GeminiRoutes extends BaseRouteHandler {
   });
 
   private handleSetTier = this.wrapHandler((req: Request, res: Response): void => {
+    if (isForeignLoopbackBrowserWrite(req)) {
+      res.status(403).json({ error: 'Gemini writes from a different localhost origin are not allowed' });
+      return;
+    }
     const { tier } = req.body ?? {};
     if (tier !== 'free' && tier !== 'payg') {
       res.status(400).json({ error: 'Invalid tier. Expected "free" or "payg"' });

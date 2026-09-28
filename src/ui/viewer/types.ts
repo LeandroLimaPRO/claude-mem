@@ -46,56 +46,7 @@ export type FeedItem =
   | (Summary & { itemType: 'summary' })
   | (UserPrompt & { itemType: 'prompt' });
 
-export interface GeminiModelInfo {
-  id: string;
-  displayName: string;
-  category: 'pro' | 'flash' | 'gemma' | 'omni' | 'lite';
-  rank: number;
-  rpmLimit: number;
-  tpmLimit: number;
-  rpdLimit: number;
-  contextWindow: number;
-  outputLimit: number;
-  description?: string;
-  isPerpetualAlias?: boolean;
-  isPreview?: boolean;
-}
-
-export interface ModelUsageState {
-  rpmUsed: number;
-  rpmLimit: number;
-  tpmUsed: number;
-  tpmLimit: number;
-  rpdUsed: number;
-  rpdLimit: number;
-  status: 'active' | 'ready' | 'cooldown' | 'exhausted' | 'unsupported';
-  cooldownUntilMs?: number;
-  cooldownReason?: string;
-  totalRequestsServed: number;
-}
-
-export interface GeminiRateLimitsStatus {
-  provider: 'gemini';
-  activeModel: string;
-  autoFallback: boolean;
-  tier?: 'free' | 'payg';
-  models: Record<string, ModelUsageState>;
-  cascade: GeminiModelInfo[];
-  queue: {
-    depth: number;
-    isProcessing: boolean;
-    isWaitingForQuota: boolean;
-    quotaWaitRemainingMs: number;
-    lastEvent?: string;
-  };
-  lastUpdated: number;
-  lastSwitchEvent?: {
-    fromModel: string;
-    toModel: string;
-    reason: string;
-    timestamp: number;
-  };
-}
+export type { GeminiModelInfo, ModelUsageState, GeminiRateLimitsStatus } from '../../services/worker/gemini/types.js';
 
 export interface StreamEvent {
   type:

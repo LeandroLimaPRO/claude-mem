@@ -14,6 +14,7 @@ import { DynamicModelRegistry } from './gemini/DynamicModelRegistry.js';
 import { GeminiStatusBroadcaster } from './gemini/GeminiStatusBroadcaster.js';
 import { DEFAULT_MODEL_CASCADE } from './gemini/model-cascade.js';
 import { setTimeout as sleep } from 'node:timers/promises';
+import type { TokenReservation } from './gemini/types.js';
 
 // v1beta is required: the current Gemini 3.x models, Gemma models, and the Google-maintained
 // `-latest` aliases are exposed under v1beta.
@@ -79,7 +80,7 @@ export function classifyGeminiError(input: {
       lower.includes('waitlist')
     ) {
       return new ClassifiedProviderError(
-        `Gemini model restricted (status ${status}): ${body}`,
+        `Gemini model restricted (status ${status})`,
         { kind: 'model_restricted', cause },
       );
     }
@@ -91,7 +92,7 @@ export function classifyGeminiError(input: {
 
   if (status === 422 || lower.includes('unprocessable')) {
     return new ClassifiedProviderError(
-      `Gemini unprocessable entity (422): ${body}`,
+      'Gemini unprocessable entity (422)',
       { kind: 'model_incompatible', cause },
     );
   }
@@ -111,7 +112,7 @@ export function classifyGeminiError(input: {
 
   if (lower.includes('overloaded')) {
     return new ClassifiedProviderError(
-      `Gemini model overloaded (status ${status ?? 503}): ${body}`,
+      `Gemini model overloaded (status ${status ?? 503})`,
       { kind: 'model_overloaded', cause, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
     );
   }
@@ -216,6 +217,7 @@ interface GeminiContent {
 export interface GeminiConfig {
   apiKey: string;
   model: string;
+  configuredModel?: string;
   rateLimitingEnabled: boolean;
   autoFallback: boolean;
 }
@@ -295,7 +297,13 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
   }
 
   protected async query(history: ConversationMessage[], config: GeminiConfig, signal?: AbortSignal): Promise<ProviderQueryResult> {
-    return this.executeWithDynamicCascade(history, config, signal);
+    const latest = this.getGeminiConfig();
+    return this.executeWithDynamicCascade(history, {
+      ...config,
+      model: config.model === (config.configuredModel ?? config.model) ? latest.model : config.model,
+      rateLimitingEnabled: latest.rateLimitingEnabled,
+      autoFallback: latest.autoFallback,
+    }, signal);
   }
 
   private fetchGenerateContent(
@@ -325,6 +333,38 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
    * Execute request with dynamic rate limiting, predictive demotion,
    * reactive fallback on 429, and automatic promotion when capacity frees up.
    */
+  private async waitForReservation(preferredModel: string, estimatedTokens: number, signal?: AbortSignal): Promise<{
+    modelId: string; reservation: TokenReservation;
+  }> {
+    let waiting = false;
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        const selection = this.tracker.selectBestAvailableModel(preferredModel, estimatedTokens);
+        const admission = selection.waitMs > 0
+          ? { reservation: undefined, waitMs: selection.waitMs, reason: selection.reason }
+          : this.tracker.tryReserve(selection.selectedModel.id, estimatedTokens);
+        if (admission.reservation) return { modelId: selection.selectedModel.id, reservation: admission.reservation };
+        if (!Number.isFinite(admission.waitMs) || admission.waitMs <= 0) {
+          throw new ClassifiedProviderError('No usable Gemini quota is available', { kind: 'unrecoverable', cause: null });
+        }
+        if (!waiting) {
+          this.tracker.beginQuotaWait(admission.waitMs);
+          waiting = true;
+        } else {
+          this.tracker.updateQueueState({ quotaWaitRemainingMs: admission.waitMs });
+        }
+        const waitMs = Math.min(60_000, admission.waitMs);
+        GeminiStatusBroadcaster.getInstance().broadcastQueuePaused(Math.ceil(admission.waitMs / 1000), admission.reason ?? 'rate_limit');
+        await sleep(waitMs, undefined, { signal });
+      }
+    } finally {
+      if (waiting) {
+        if (this.tracker.endQuotaWait()) GeminiStatusBroadcaster.getInstance().broadcastQueueResumed();
+      }
+    }
+  }
+
   private async executeWithDynamicCascade(
     history: ConversationMessage[],
     config: GeminiConfig,
@@ -335,60 +375,35 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const contents = this.conversationToGeminiContents(history);
 
     const attemptedModels = new Set<string>();
-    let lastFallbackError: unknown;
-    let currentModelId = config.model === 'auto'
-      ? this.registry.getCascade()[0]?.id
-      : config.model;
-    if (!currentModelId) throw new Error('Gemini model cascade is empty.');
-
+    let currentModelId = config.model;
+    let targetModelId = currentModelId;
+      let priorRequestId: string | null = null;
     while (true) {
       signal?.throwIfAborted();
-      // Predictive selection: check capacity of preferred model vs cascade
-      let targetModelId = currentModelId;
-      if (config.rateLimitingEnabled) {
-        let selection = this.tracker.selectBestAvailableModel(currentModelId, estimatedTokens);
-        targetModelId = selection.selectedModel.id;
-        if (attemptedModels.has(targetModelId)) throw lastFallbackError;
-
-        if (selection.waitMs > 0) {
-          try {
-            while (selection.waitMs > 0) {
-              const waitSec = Math.ceil(selection.waitMs / 1000);
-              logger.info('SDK', `All models rate-limited; pausing queue for ${waitSec}s...`, {
-                model: targetModelId,
-                waitMs: selection.waitMs
-              });
-              this.tracker.updateQueueState({ isWaitingForQuota: true, quotaWaitRemainingMs: selection.waitMs });
-              GeminiStatusBroadcaster.getInstance().broadcastQueuePaused(waitSec, selection.reason ?? 'rate_limit');
-              await sleep(Math.min(60_000, selection.waitMs), undefined, { signal });
-              selection = this.tracker.selectBestAvailableModel(currentModelId, estimatedTokens);
-              targetModelId = selection.selectedModel.id;
-              if (attemptedModels.has(targetModelId)) throw lastFallbackError;
-            }
-          } finally {
-            this.tracker.updateQueueState({ isWaitingForQuota: false, quotaWaitRemainingMs: 0 });
-            GeminiStatusBroadcaster.getInstance().broadcastQueueResumed();
-          }
-        }
-      }
-
-      if (attemptedModels.has(targetModelId)) throw lastFallbackError;
-      attemptedModels.add(targetModelId);
-      logger.debug('SDK', `Querying Gemini dynamic cascade (model: ${targetModelId}, attempt: ${attemptedModels.size})`, {
-        turns: history.length,
-        totalChars,
-        estimatedTokens
-      });
-
-      const url = `${GEMINI_API_URL}/${targetModelId}:generateContent?key=${config.apiKey}`;
-      let priorRequestId: string | null = null;
-
+      let reservation: TokenReservation | undefined;
       try {
         const data = await withRetry<GeminiResponse>(async (attemptSignal) => {
+          let sent = false;
+          let parsed: GeminiResponse | undefined;
+          try {
           let response: Response;
           try {
+            if (!config.rateLimitingEnabled) {
+              targetModelId = currentModelId === 'auto' ? this.registry.getCascade()[0]?.id ?? '' : currentModelId;
+              if (!this.registry.getModel(targetModelId)) {
+                throw new ClassifiedProviderError(`Unknown Gemini model: ${targetModelId}`, { kind: 'unrecoverable', cause: null });
+              }
+            }
+            if (attemptedModels.has(targetModelId)) {
+              throw new ClassifiedProviderError('Gemini cascade repeated a rejected model', { kind: 'unrecoverable', cause: null });
+            }
+            const url = `${GEMINI_API_URL}/${encodeURIComponent(targetModelId)}:generateContent?key=${config.apiKey}`;
+            attemptSignal.throwIfAborted();
+            sent = true;
             response = await this.fetchGenerateContent(url, contents, priorRequestId, attemptSignal);
           } catch (networkError: unknown) {
+            if (networkError instanceof ClassifiedProviderError) throw networkError;
+            if (attemptSignal.aborted) throw networkError;
             const err = networkError instanceof Error ? networkError : new Error(String(networkError));
             throw classifyGeminiError({ cause: err });
           }
@@ -452,8 +467,24 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             throw classified;
           }
 
-          return await response.json() as GeminiResponse;
-        }, { label: `Gemini ${targetModelId}`, abortSignal: signal, ...(signal ? { maxRetries: 0 } : {}) });
+          parsed = await response.json() as GeminiResponse;
+          return parsed;
+          } finally {
+            if (reservation) {
+              this.tracker.reconcileReservation(reservation, parsed?.usageMetadata?.promptTokenCount, sent, !!parsed);
+              reservation = undefined;
+            }
+          }
+        }, {
+          label: `Gemini ${targetModelId}`,
+          abortSignal: signal,
+          ...(signal ? { maxRetries: 0 } : {}),
+          beforeAttempt: config.rateLimitingEnabled ? async waitSignal => {
+            const admission = await this.waitForReservation(currentModelId, estimatedTokens, waitSignal);
+            targetModelId = admission.modelId;
+            reservation = admission.reservation;
+          } : undefined,
+        });
 
         const finishReason = (data as any)?.candidates?.[0]?.finishReason;
         const promptFeedback = (data as any)?.promptFeedback;
@@ -482,9 +513,6 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
         const content = textContent;
         const tokensUsed = data.usageMetadata?.totalTokenCount ?? estimatedTokens;
 
-        // Record real token usage and successful request in tracker
-        this.tracker.recordRequestSuccess(targetModelId, tokensUsed);
-
         return {
           content,
           tokensUsed,
@@ -505,10 +533,10 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             fallbackReason
           );
           currentModelId = nextModel;
+          attemptedModels.add(targetModelId);
           if (attemptedModels.has(nextModel)) {
             throw lastErr;
           }
-          lastFallbackError = lastErr;
           continue; // Retry with next model
         }
 
@@ -535,11 +563,8 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const autoFallback = (settings as any).CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'false';
 
     this.tracker.setAutoFallback(autoFallback);
-    if (configuredModel !== 'auto') {
-      this.tracker.setActiveModel(configuredModel);
-    }
 
-    return { apiKey, model: configuredModel, rateLimitingEnabled, autoFallback };
+    return { apiKey, model: configuredModel, configuredModel, rateLimitingEnabled, autoFallback };
   }
 }
 

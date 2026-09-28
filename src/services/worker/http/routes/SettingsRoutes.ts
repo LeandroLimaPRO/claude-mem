@@ -13,6 +13,8 @@ import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsMana
 import { clearPortCache } from '../../../../shared/worker-utils.js';
 import { snapshotDependencyHealth } from '../../../../shared/dependency-health.js';
 import { parseJsonWithBom, writeJsonFileAtomic } from '../../../../shared/atomic-json.js';
+import { DynamicModelRegistry } from '../../gemini/DynamicModelRegistry.js';
+import { RateLimitTracker } from '../../gemini/RateLimitTracker.js';
 
 const toggleMcpSchema = z.object({
   enabled: z.boolean(),
@@ -196,6 +198,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_GEMINI_API_KEY',
       'CLAUDE_MEM_GEMINI_MODEL',
       'CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED',
+      'CLAUDE_MEM_GEMINI_AUTO_FALLBACK',
       'CLAUDE_MEM_OPENROUTER_API_KEY',
       'CLAUDE_MEM_OPENROUTER_BASE_URL',
       'CLAUDE_MEM_OPENROUTER_MODEL',
@@ -238,6 +241,10 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     writeJsonFileAtomic(settingsPath, settings);
 
+    if (req.body.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== undefined) {
+      RateLimitTracker.getInstance().setAutoFallback(settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'false');
+    }
+
     clearPortCache();
 
     logger.info('WORKER', 'Settings updated');
@@ -271,11 +278,17 @@ export class SettingsRoutes extends BaseRouteHandler {
       }
     }
 
-    if (settings.CLAUDE_MEM_GEMINI_MODEL) {
-      const validGeminiModels = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview'];
-      if (!validGeminiModels.includes(settings.CLAUDE_MEM_GEMINI_MODEL)) {
-        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be one of: gemini-flash-latest, gemini-flash-lite-latest, gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3-flash-preview' };
-      }
+    if (settings.CLAUDE_MEM_GEMINI_MODEL !== undefined &&
+        (typeof settings.CLAUDE_MEM_GEMINI_MODEL !== 'string' ||
+         (settings.CLAUDE_MEM_GEMINI_MODEL !== 'auto' &&
+          !DynamicModelRegistry.getInstance().getModel(settings.CLAUDE_MEM_GEMINI_MODEL)))) {
+      return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be auto or a model in the Gemini catalog' };
+    }
+
+    if (settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== undefined &&
+        settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'true' &&
+        settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'false') {
+      return { valid: false, error: 'CLAUDE_MEM_GEMINI_AUTO_FALLBACK must be true or false' };
     }
 
     if (settings.CLAUDE_MEM_CONTEXT_OBSERVATIONS) {

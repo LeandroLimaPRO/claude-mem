@@ -347,4 +347,19 @@ describe('ClaudeProvider assistant frame dispatch (#3492)', () => {
     expect(harness.resetProcessingToPending).toHaveBeenCalledTimes(1);
     expect(harness.remainingClaimed()).toHaveLength(1);
   });
+
+  it('preserves the batch after two textless SDK failures without confirming it', async () => {
+    const session = createSession();
+    const harness = createHarness(session);
+    scriptedMessages = [
+      resultFrame({ subtype: 'error_during_execution', is_error: true }),
+      resultFrame({ subtype: 'error_during_execution', is_error: true }),
+    ];
+
+    await harness.provider.startSession(session);
+
+    expect(harness.confirmClaimedMessages).not.toHaveBeenCalled();
+    expect(harness.remainingClaimed()).toHaveLength(1);
+    expect(session.abortReason).toBe('transport:empty_sdk_result');
+  });
 });

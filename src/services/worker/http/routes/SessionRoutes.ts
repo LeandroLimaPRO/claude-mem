@@ -400,16 +400,10 @@ export class SessionRoutes extends BaseRouteHandler {
           return;
         }
 
-        // No retry: the generator failed, the in-RAM batch is dropped, and the
-        // transcript is the recovery path. The next observation ingest will
-        // start a fresh generator via ensureGeneratorRunning.
+        // No immediate retry: preserve the claimed batch for the next ingest.
         //
         // The local error line (full fidelity) and the scrubbed
         // session_compressed rollup are one logical event.
-        // No abort_reason here: every site that sets abortReason aborts the
-        // controller on its next line, so aborted generators either resolve
-        // normally (quota/overflow break) or hit the signal-aborted early
-        // return above — this catch only ever sees non-abort rejections.
         // Reset claimed messages so any pending observations remain in the buffer
         // and are drained on the next run instead of being dropped
         try {
@@ -420,6 +414,12 @@ export class SessionRoutes extends BaseRouteHandler {
             error: resetErr instanceof Error ? resetErr.message : String(resetErr),
           });
         }
+
+        session.abortReason = isClassified(error) && error.kind === 'auth_invalid'
+          ? 'auth:provider_failure'
+          : isClassified(error) && error.kind === 'quota_exhausted'
+            ? 'quota:provider_failure'
+            : 'transport:provider_failure';
 
         if (isClassified(error)) {
           logger.error('SESSION', 'Observer failed', {

@@ -48,12 +48,14 @@ export interface QueueState {
 export interface GeminiRateLimitsStatus {
   provider: 'gemini';
   activeModel: string;
+  configuredModel?: string;
   autoFallback: boolean;
   tier?: 'free' | 'payg';
   models: Record<string, ModelUsageState>;
   cascade: GeminiModelInfo[];
   queue: QueueState;
   lastUpdated: number;
+  dailyResetAtMs?: number;
   lastSwitchEvent?: {
     fromModel: string;
     toModel: string;

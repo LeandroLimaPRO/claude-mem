@@ -119,7 +119,7 @@
   <a href="#-recursos--ajustes-do-fork">Recursos do Fork</a> •
   <a href="#-guia-de-instalação">Guia de Instalação</a> •
   <a href="#-arquitetura-do-sistema">Arquitetura</a> •
-  <a href="#-automação-de-overlay--imunidade-a-updates">Automação de Overlay</a> •
+  <a href="#3-build-versionado-do-fork">Build e Instalação</a> •
   <a href="#início-rápido">Início Rápido Upstream</a> •
   <a href="#como-funciona">Como Funciona</a> •
   <a href="#ferramentas-de-busca-mcp">Ferramentas MCP</a> •
@@ -128,19 +128,18 @@
 </p>
 
 <p align="center">
-  Claude-Mem preserva o contexto perfeitamente entre sessões, capturando automaticamente observações de uso de ferramentas, gerando resumos semânticos e disponibilizando-os para sessões futuras.
+  Claude-Mem ajuda a preservar o contexto entre sessões, capturando observações de uso de ferramentas, gerando resumos semânticos e disponibilizando-os para sessões futuras.
 </p>
 
 ---
 
 ## ⚡ Fork Aprimorado: Edição Gemini Dynamic Engine & Antigravity CLI
 
-> **Fork customizado desenvolvido para suporte nativo ao Antigravity CLI (`agy`), motor dinâmico Gemini com Rate-Limiter adaptativo e arquitetura de overlay imune a sobrescritas de auto-update.**
+> **Fork customizado desenvolvido para suporte nativo ao Antigravity CLI (`agy`), motor dinâmico Gemini com Rate-Limiter adaptativo e builds versionados deste fork.**
 
 <p align="center">
   <img src="https://img.shields.io/badge/Edição_Fork-Antigravity_%2B_Gemini_Engine-0284c7?style=for-the-badge&logo=google" alt="Edição Antigravity" />
   <img src="https://img.shields.io/badge/Gemini_Rate_Limiter-Dinâmico_%26_Adaptativo-8250df?style=for-the-badge&logo=googlegemini" alt="Gemini Dynamic Engine" />
-  <img src="https://img.shields.io/badge/Proteção_Overlay-Imune_a_Auto--Updates-10b981?style=for-the-badge&logo=powershell" alt="Overlay Protegido" />
 </p>
 
 ---
@@ -150,7 +149,7 @@
 #### 1. 🧠 Gemini Dynamic Engine & Rate Limiter Inteligente
 - **Badge Interativo no Cabeçalho:** O Web Viewer exibe em tempo real o modelo ativo, limites de RPM, consumo de tokens e status de cooldown.
 - **Indicador Visual de Pausa (`is-paused`):** Animação pulsante elegante quando o provedor atinge limite de cota (`quota_exhausted`), com temporizador regressivo.
-- **Fila Segura de Observações:** Durante cooldowns de cota, as observações permanecem em buffer seguro no SQLite, evitando travamentos ou perda de contexto.
+- **Fila de Observações:** Durante cooldowns de cota, as observações pendentes permanecem na fila em memória enquanto o processo do worker estiver ativo.
 - **Mitigação de Falhas em Cascata:** Backoff exponencial automático que previne disparos repetitivos e bloqueios de IP/API.
 
 #### 2. 🪐 Suporte Nativo ao Antigravity CLI (`agy`)
@@ -158,13 +157,8 @@
 - **Estilização e Badges Dedicados:** Tags com destaque visual exclusivo (`.source-antigravity-cli`) em azul celeste para os temas claro e escuro no Viewer.
 - **Continuidade Cross-Agent:** Compartilhamento transparente de contexto e memórias entre Claude Code, Antigravity CLI e Codex no mesmo projeto.
 
-#### 3. 🛡️ Arquitetura de Custom Overlay (Imunidade a Auto-Updates)
-O gerenciador de plugins do Claude Code baixa novas pastas de cache a cada atualização upstream. Este fork resolve isso com um sistema de **overlay permanente**:
-- **Pasta Permanente Protegida:** Arquivos customizados, fontes e patches ficam salvos em `~/.claude-mem/custom-overlay/`.
-- **Scripts de Restauração em 1 Clique:**
-  - `apply-overlay.cmd` (Executável por duplo clique no Windows)
-  - `apply-overlay.ps1` (Script PowerShell inteligente que detecta a pasta ativa no `installed_plugins.json`)
-- **Backup de Segurança Prévio:** Cria automaticamente um `.backup-before-overlay` dos arquivos originais antes de aplicar as melhorias.
+#### 3. Build Versionado do Fork
+Escolha uma tag ou commit e gere o plugin a partir dessa versão. Após uma atualização, gere e instale a versão escolhida novamente; alterações manuais no cache do plugin não persistem.
 
 #### 4. 🎨 Web Viewer Modernizado
 - **Tipografia `Monaspace Radon`:** Fontes dedicadas para leitura confortável de código e resumos de contexto.
@@ -175,18 +169,15 @@ O gerenciador de plugins do Claude Code baixa novas pastas de cache a cada atual
 
 ### 📦 Guia de Instalação
 
-#### Opção A: Restauração / Aplicação com 1 Clique (Recomendado)
-Se você já possui o Claude-Mem instalado e deseja aplicar este pacote com todas as melhorias:
-1. Os arquivos estão salvos em `~/.claude-mem/custom-overlay/`.
-2. Dê um duplo clique em:
-   ```cmd
-   C:\Users\<SeuUsuario>\.claude-mem\custom-overlay\apply-overlay.cmd
-   ```
-   Ou pelo PowerShell:
-   ```powershell
-   powershell.exe -ExecutionPolicy Bypass -File "C:\Users\<SeuUsuario>\.claude-mem\custom-overlay\apply-overlay.ps1"
-   ```
-3. O script localizará a versão ativa, criará o backup e reaplicará a interface e os drivers do Antigravity automaticamente.
+#### Opção A: Gerar uma Versão do Fork
+```bash
+git clone <url-do-seu-fork> claude-mem
+cd claude-mem
+git checkout <tag-ou-commit>
+npm ci
+npm run build
+```
+Depois registre o marketplace do fork e instale o plugin conforme a Opção B abaixo.
 
 #### Opção B: Adicionar este Fork no Marketplace do Claude Code
 No arquivo `known_marketplaces.json`:
@@ -246,11 +237,6 @@ flowchart TD
         DB[("SQLite + Chroma Vector DB")]
     end
 
-    subgraph Proteção ["Sistema de Overlay Permanente"]
-        OVR["~/.claude-mem/custom-overlay/"]
-        SCR["apply-overlay.ps1 / .cmd"]
-        ACT["Cache Ativo (~/.claude/plugins/cache/.../)"]
-    end
 
     subgraph Interface ["Web Viewer Moderno"]
         VW["viewer.html (UI Enriquecida 95KB)"]
@@ -266,10 +252,8 @@ flowchart TD
     H --> SS
     SS --> DB
     GDE --> DB
+    GDE --> VW
 
-    OVR -->|Injeção 1-Clique| SCR
-    SCR -->|Aplica Patches| ACT
-    ACT --> VW
 
     VW --> BDG
     VW --> MONO
@@ -283,11 +267,6 @@ flowchart TD
   Indica um cooldown de cota temporário (`quota_exhausted`) no provedor de IA (ex: Gemini API gratuita).  
   > **Importante:** **NÃO** reinicie o worker. Reiniciar zera a contagem de recuo e sobrecarrega a API. As novas observações continuam seguras na fila e serão processadas assim que o cooldown expirar.
 
-- **O Claude Code atualizou e minha interface customizada sumiu:**  
-  Basta executar o `apply-overlay.cmd` em `~/.claude-mem/custom-overlay/`.
-
-- **Como checar a saúde do serviço?**  
-  Acesse `http://127.0.0.1:37777/api/gemini/status` no seu navegador.
 
 ---
 

@@ -17,6 +17,7 @@ interface HeaderProps {
   onContextPreviewToggle: () => void;
   onShowHelp?: () => void;
   geminiStatus?: GeminiRateLimitsStatus | null;
+  selectedProvider?: string;
   onOpenGeminiStatus?: () => void;
 }
 
@@ -31,6 +32,7 @@ export function Header({
   onContextPreviewToggle,
   onShowHelp,
   geminiStatus,
+  selectedProvider,
   onOpenGeminiStatus
 }: HeaderProps) {
   useSpinningFavicon(isProcessing);
@@ -49,7 +51,7 @@ export function Header({
           </div>
           <span className="logo-text">claude-mem</span>
         </h1>
-        {geminiStatus && (() => {
+        {selectedProvider === 'gemini' && geminiStatus && (() => {
           const activeState = geminiStatus.models[geminiStatus.activeModel];
           const rpdLimit = activeState?.rpdLimit || 1500;
           const rpdUsed = activeState?.rpdUsed || 0;

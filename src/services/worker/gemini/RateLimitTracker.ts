@@ -2,20 +2,45 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from '
 import { dirname } from 'path';
 import { logger } from '../../../utils/logger.js';
 import { paths } from '../../../shared/paths.js';
+import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
 import type {
   GeminiModelInfo,
   ModelUsageState,
   GeminiRateLimitsStatus,
   QueueState,
   ModelStatus,
+  TokenReservation,
 } from './types.js';
+import { ClassifiedProviderError } from '../provider-errors.js';
 import { DynamicModelRegistry } from './DynamicModelRegistry.js';
 import { getTierLimits } from './model-cascade.js';
 
 interface PersistedRpdData {
-  date: string; // YYYY-MM-DD UTC
+  date: string; // YYYY-MM-DD in America/Los_Angeles
   counts: Record<string, number>;
   tier?: 'free' | 'payg';
+  timeZone?: string;
+}
+
+const quotaDateFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+
+export function quotaDay(now: number = Date.now()): string {
+  const parts = Object.fromEntries(quotaDateFormatter.formatToParts(now).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+export function nextDailyResetAtMs(now: number = Date.now()): number {
+  const today = quotaDay(now);
+  let low = now;
+  let high = now + 26 * 60 * 60 * 1000;
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (quotaDay(middle) === today) low = middle;
+    else high = middle;
+  }
+  return high;
 }
 
 export class RateLimitTracker {
@@ -26,10 +51,12 @@ export class RateLimitTracker {
 
   // Sliding 60-second window of tokens used per model: modelId -> { timestamp, tokens }[]
   private tpmRecords = new Map<string, Array<{ timestamp: number; tokens: number }>>();
+  private reservations = new Map<string, TokenReservation>();
+  private nextReservationId = 0;
 
   // Persisted daily request counts (RPD) and user plan tier
   private rpdCounts: Record<string, number> = {};
-  private currentUtcDate: string = '';
+  private currentQuotaDate: string = '';
   private tier: 'free' | 'payg' = 'free';
 
   // Cooldown status per model
@@ -52,6 +79,7 @@ export class RateLimitTracker {
     isWaitingForQuota: false,
     quotaWaitRemainingMs: 0,
   };
+  private quotaWaiters = 0;
 
   // Last model switch event for UI
   private lastSwitchEvent?: {
@@ -66,13 +94,13 @@ export class RateLimitTracker {
   private sweepIntervalTimer?: ReturnType<typeof setInterval>;
 
   private constructor() {
-    this.currentUtcDate = this.getTodayUtcString();
+    this.currentQuotaDate = quotaDay();
     this.loadPersistedRpd();
     this.sweepIntervalTimer = setInterval(() => {
       try {
         this.sweepStaleRecords();
       } catch (err) {
-        logger.warn('GEMINI', 'Error sweeping stale rate limit records', { err });
+        logger.warn('SDK', 'Error sweeping stale rate limit records', { err });
       }
     }, 60_000);
     if (typeof this.sweepIntervalTimer.unref === 'function') {
@@ -99,7 +127,7 @@ export class RateLimitTracker {
   public setTier(tier: 'free' | 'payg'): void {
     this.tier = tier;
     this.persistRpd();
-    logger.info('GEMINI', `User plan tier set to: ${tier}`);
+    logger.info('SDK', `User plan tier set to: ${tier}`);
     this.notifyChange();
   }
 
@@ -111,7 +139,7 @@ export class RateLimitTracker {
     this.ensureDateRollover();
     this.rpdCounts[modelId] = Math.max(0, Math.floor(count));
     this.persistRpd();
-    logger.info('GEMINI', `Manual RPD calibrated for ${modelId}: ${this.rpdCounts[modelId]}`);
+    logger.info('SDK', `Manual RPD calibrated for ${modelId}: ${this.rpdCounts[modelId]}`);
     this.notifyChange();
   }
 
@@ -129,15 +157,23 @@ export class RateLimitTracker {
     this.notifyChange();
   }
 
-  private getTodayUtcString(): string {
-    return new Date().toISOString().slice(0, 10);
+  public beginQuotaWait(waitMs: number): void {
+    this.quotaWaiters++;
+    this.updateQueueState({ isWaitingForQuota: true, quotaWaitRemainingMs: waitMs });
+  }
+
+  public endQuotaWait(): boolean {
+    this.quotaWaiters = Math.max(0, this.quotaWaiters - 1);
+    if (this.quotaWaiters > 0) return false;
+    this.updateQueueState({ isWaitingForQuota: false, quotaWaitRemainingMs: 0 });
+    return true;
   }
 
   private ensureDateRollover(): void {
-    const today = this.getTodayUtcString();
-    if (this.currentUtcDate !== today) {
-      logger.info('GEMINI', `RPD date rolled over from ${this.currentUtcDate} to ${today}; resetting daily quotas`);
-      this.currentUtcDate = today;
+    const today = quotaDay();
+    if (this.currentQuotaDate !== today) {
+      logger.info('SDK', `RPD date rolled over from ${this.currentQuotaDate} to ${today}; resetting daily quotas`);
+      this.currentQuotaDate = today;
       this.rpdCounts = {};
       this.persistRpd();
     }
@@ -149,7 +185,7 @@ export class RateLimitTracker {
       if (!existsSync(filePath)) return;
       const raw = readFileSync(filePath, 'utf-8');
       const data = JSON.parse(raw) as PersistedRpdData;
-      if (data && data.date === this.currentUtcDate && data.counts) {
+      if (data?.counts && (!data.timeZone || data.date === this.currentQuotaDate)) {
         this.rpdCounts = { ...data.counts };
       } else {
         this.rpdCounts = {};
@@ -159,7 +195,7 @@ export class RateLimitTracker {
       }
       this.persistRpd();
     } catch (err) {
-      logger.warn('GEMINI', 'Could not read persisted rate limits file', {}, err as Error);
+      logger.warn('SDK', 'Could not read persisted rate limits file', {}, err as Error);
       this.rpdCounts = {};
     }
   }
@@ -169,19 +205,21 @@ export class RateLimitTracker {
       const filePath = paths.geminiRateLimits();
       mkdirSync(dirname(filePath), { recursive: true });
       const data: PersistedRpdData = {
-        date: this.currentUtcDate,
+        date: this.currentQuotaDate,
         counts: this.rpdCounts,
         tier: this.tier,
+        timeZone: 'America/Los_Angeles',
       };
       const tmpPath = `${filePath}.${process.pid}.tmp`;
       writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
       renameSync(tmpPath, filePath);
     } catch (err) {
-      logger.warn('GEMINI', 'Could not persist rate limits file', {}, err as Error);
+      logger.warn('SDK', 'Could not persist rate limits file', {}, err as Error);
     }
   }
 
   public resetAllCounters(): void {
+    this.reservations.clear();
     this.rpmTimestamps.clear();
     this.tpmRecords.clear();
     this.cooldowns.clear();
@@ -311,10 +349,7 @@ export class RateLimitTracker {
       return { allowed: false, waitMs: Infinity, reason: 'unsupported' };
     }
     if (statusObj.status === 'exhausted') {
-      // Calculate ms until midnight UTC
-      const tomorrow = new Date();
-      tomorrow.setUTCHours(24, 0, 0, 0);
-      return { allowed: false, waitMs: tomorrow.getTime() - now, reason: statusObj.reason };
+      return { allowed: false, waitMs: nextDailyResetAtMs(now) - now, reason: statusObj.reason };
     }
     if (statusObj.status === 'cooldown' && statusObj.cooldownUntilMs) {
       return { allowed: false, waitMs: Math.max(0, statusObj.cooldownUntilMs - now), reason: statusObj.reason };
@@ -323,17 +358,18 @@ export class RateLimitTracker {
     const registry = DynamicModelRegistry.getInstance();
     const info = registry.getModel(modelId);
     if (!info) {
-      return { allowed: true, waitMs: 0 };
+      return { allowed: false, waitMs: Infinity, reason: 'unknown_model' };
     }
 
     const limits = getTierLimits(info, this.tier);
+    if (estimatedTokens > limits.tpmLimit || estimatedTokens > info.contextWindow) {
+      return { allowed: false, waitMs: Infinity, reason: 'request_too_large' };
+    }
 
     // Check RPD
     const rpdUsed = this.getRpdUsed(modelId);
     if (rpdUsed >= limits.rpdLimit) {
-      const tomorrow = new Date();
-      tomorrow.setUTCHours(24, 0, 0, 0);
-      return { allowed: false, waitMs: tomorrow.getTime() - now, reason: 'rpd_limit' };
+      return { allowed: false, waitMs: nextDailyResetAtMs(now) - now, reason: 'rpd_limit' };
     }
 
     // Check RPM
@@ -354,6 +390,46 @@ export class RateLimitTracker {
     }
 
     return { allowed: true, waitMs: 0 };
+  }
+
+  public tryReserve(modelId: string, estimatedInputTokens: number, now: number = Date.now()): {
+    reservation?: TokenReservation; waitMs: number; reason?: string;
+  } {
+    const check = this.canExecute(modelId, estimatedInputTokens, now);
+    if (!check.allowed) return { waitMs: check.waitMs, reason: check.reason };
+    const reservation = { id: String(++this.nextReservationId), model: modelId, estimatedTokens: estimatedInputTokens, timestamp: now };
+    this.reservations.set(reservation.id, reservation);
+    this.updateQueueState({ isProcessing: true, depth: this.reservations.size });
+    this.rpmTimestamps.set(modelId, [...(this.rpmTimestamps.get(modelId) ?? []), now]);
+    this.tpmRecords.set(modelId, [...(this.tpmRecords.get(modelId) ?? []), { timestamp: now, tokens: estimatedInputTokens }]);
+    this.rpdCounts[modelId] = (this.rpdCounts[modelId] ?? 0) + 1;
+    this.persistRpd();
+    this.notifyChange();
+    return { reservation, waitMs: 0 };
+  }
+
+  public reconcileReservation(reservation: TokenReservation, actualInputTokens?: number, sent = true, success = false): void {
+    if (!this.reservations.delete(reservation.id)) return;
+    this.updateQueueState({ isProcessing: this.reservations.size > 0, depth: this.reservations.size });
+    const modelId = reservation.model;
+    const tokens = this.tpmRecords.get(modelId) ?? [];
+    const tokenIndex = tokens.findIndex(r => r.timestamp === reservation.timestamp && r.tokens === reservation.estimatedTokens);
+    if (tokenIndex >= 0) {
+      if (sent) tokens[tokenIndex].tokens = actualInputTokens ?? reservation.estimatedTokens;
+      else tokens.splice(tokenIndex, 1);
+    }
+    if (!sent) {
+      const rpm = this.rpmTimestamps.get(modelId) ?? [];
+      const rpmIndex = rpm.indexOf(reservation.timestamp);
+      if (rpmIndex >= 0) rpm.splice(rpmIndex, 1);
+      this.rpdCounts[modelId] = Math.max(0, (this.rpdCounts[modelId] ?? 0) - 1);
+      this.persistRpd();
+    }
+    if (success) {
+      this.lifetimeRequests.set(modelId, (this.lifetimeRequests.get(modelId) ?? 0) + 1);
+      this.activeModelId = modelId;
+    }
+    this.notifyChange();
   }
 
   /**
@@ -377,9 +453,14 @@ export class RateLimitTracker {
 
     // If preferredModel is 'auto', we start from rank 1
     const isAuto = preferredModel === 'auto' || !preferredModel;
-    const startIndex = isAuto
-      ? 0
-      : Math.max(0, cascade.findIndex(m => m.id === preferredModel));
+    const startIndex = isAuto ? 0 : cascade.findIndex(m => m.id === preferredModel);
+    if (startIndex < 0) {
+      throw new ClassifiedProviderError(`Unknown Gemini model: ${preferredModel}`, { kind: 'unrecoverable', cause: null });
+    }
+    const candidates = isAuto || this.autoFallbackEnabled ? cascade : [cascade[startIndex]];
+    if (candidates.every(m => estimatedTokens > getTierLimits(m, this.tier).tpmLimit || estimatedTokens > m.contextWindow)) {
+      throw new ClassifiedProviderError('Gemini request exceeds every available model capacity', { kind: 'unrecoverable', cause: null });
+    }
 
     // Try preferred model first
     if (!isAuto && startIndex !== -1) {
@@ -401,7 +482,7 @@ export class RateLimitTracker {
         if (check.allowed) {
           const willFallback = candidate.id !== preferredModel;
           if (willFallback) {
-            logger.info('GEMINI', `Cascade routed request to ${candidate.id} (preferred: ${preferredModel})`);
+            logger.info('SDK', `Cascade routed request to ${candidate.id} (preferred: ${preferredModel})`);
           }
           return { selectedModel: candidate, willFallback, waitMs: 0 };
         }
@@ -411,9 +492,9 @@ export class RateLimitTracker {
     // If all models are currently constrained by sliding 60s windows,
     // find the one with the shortest wait time
     let minWaitMs = Infinity;
-    let bestCandidate = cascade[0];
+    let bestCandidate: GeminiModelInfo | undefined;
 
-    for (const candidate of cascade) {
+    for (const candidate of candidates) {
       if (this.unsupportedModels.has(candidate.id)) continue;
       const check = this.canExecute(candidate.id, estimatedTokens, now);
       if (check.waitMs < minWaitMs) {
@@ -422,10 +503,14 @@ export class RateLimitTracker {
       }
     }
 
+    if (!bestCandidate || !Number.isFinite(minWaitMs)) {
+      throw new ClassifiedProviderError('No usable Gemini model is available', { kind: 'unrecoverable', cause: null });
+    }
+
     return {
       selectedModel: bestCandidate,
       willFallback: bestCandidate.id !== preferredModel,
-      waitMs: minWaitMs === Infinity ? 10_000 : minWaitMs,
+      waitMs: minWaitMs,
       reason: 'all_rate_limited',
     };
   }
@@ -487,12 +572,12 @@ export class RateLimitTracker {
     if (status === 404 || lower.includes('no longer available') || lower.includes('not found')) {
       this.unsupportedModels.add(modelId);
       reason = 'Model deprecated / not available';
-      logger.warn('GEMINI', `Model ${modelId} marked unsupported (404): ${bodyText.slice(0, 120)}`);
+      logger.warn('SDK', `Model ${modelId} marked unsupported (404)`);
     } else if (status === 422 || lower.includes('unprocessable') || lower.includes('invalid argument')) {
       // HTTP 422: Parameter or schema incompatibility specific to this model (e.g. Gemma, thinking models, or preview schema mismatch)
       this.cooldowns.set(modelId, { untilMs: now + 3600_000, reason: 'Incompatible payload/parameters (422)' });
       reason = 'Incompatible payload/parameters (422)';
-      logger.warn('GEMINI', `Model ${modelId} rejected payload as unprocessable (422), cooling down for 1h: ${bodyText.slice(0, 120)}`);
+      logger.warn('SDK', `Model ${modelId} rejected payload as unprocessable (422), cooling down for 1h`);
     } else if (
       status === 400 &&
       (lower.includes('not supported for generatecontent') ||
@@ -503,7 +588,7 @@ export class RateLimitTracker {
       // HTTP 400: Model does not support generateContent
       this.unsupportedModels.add(modelId);
       reason = 'Model unsupported for generation (400)';
-      logger.warn('GEMINI', `Model ${modelId} marked unsupported for generation (400): ${bodyText.slice(0, 120)}`);
+      logger.warn('SDK', `Model ${modelId} marked unsupported for generation (400)`);
     } else if (
       status === 400 &&
       (lower.includes('context limit') ||
@@ -517,7 +602,7 @@ export class RateLimitTracker {
       // HTTP 400: Context limit exceeded for this model
       this.cooldowns.set(modelId, { untilMs: now + 600_000, reason: 'Context limit exceeded (400)' });
       reason = 'Context limit exceeded (400)';
-      logger.warn('GEMINI', `Model ${modelId} context limit exceeded (400), cooling down for 10m: ${bodyText.slice(0, 120)}`);
+      logger.warn('SDK', `Model ${modelId} context limit exceeded (400), cooling down for 10m`);
     } else if (
       status === 503 ||
       lower.includes('model is overloaded') ||
@@ -528,7 +613,7 @@ export class RateLimitTracker {
       cooldownMs = retryAfterMs ?? 60_000;
       this.cooldowns.set(modelId, { untilMs: now + cooldownMs, reason: 'Model overloaded (503)' });
       reason = 'Model overloaded (503)';
-      logger.warn('GEMINI', `Model ${modelId} is overloaded (503), entering cooldown for ${Math.round(cooldownMs / 1000)}s`);
+      logger.warn('SDK', `Model ${modelId} is overloaded (503), entering cooldown for ${Math.round(cooldownMs / 1000)}s`);
     } else if (
       status === 403 &&
       (lower.includes('location is not supported') ||
@@ -540,14 +625,13 @@ export class RateLimitTracker {
       // HTTP 403: Model restricted by region or plan (API key itself is valid for standard models)
       this.unsupportedModels.add(modelId);
       reason = 'Model restricted/unavailable (403)';
-      logger.warn('GEMINI', `Model ${modelId} is restricted for current key/region (403): ${bodyText.slice(0, 120)}`);
+      logger.warn('SDK', `Model ${modelId} is restricted for current key/region (403)`);
     } else if (lower.includes('safety') && (lower.includes('blocked') || lower.includes('filter'))) {
       this.cooldowns.set(modelId, { untilMs: now + 300_000, reason: 'Blocked by safety filters' });
       reason = 'Blocked by safety filters';
-      logger.warn('GEMINI', `Model ${modelId} output blocked by safety filters, cooling down for 5m`);
+      logger.warn('SDK', `Model ${modelId} output blocked by safety filters, cooling down for 5m`);
     } else if (lower.includes('daily') || lower.includes('requests per day') || lower.includes('rpd')) {
-      const tomorrow = new Date();
-      tomorrow.setUTCHours(24, 0, 0, 0);
+      const tomorrow = new Date(nextDailyResetAtMs(now));
       cooldownMs = tomorrow.getTime() - now;
       reason = 'Daily quota exhausted';
       const info = DynamicModelRegistry.getInstance().getModel(modelId);
@@ -556,12 +640,12 @@ export class RateLimitTracker {
         this.rpdCounts[modelId] = Math.max(this.rpdCounts[modelId] ?? 0, limits.rpdLimit);
         this.persistRpd();
       }
-      logger.warn('GEMINI', `Model ${modelId} reached daily quota (auto-calibrated RPD to ${this.rpdCounts[modelId]}). Cooldown until ${tomorrow.toISOString()}`);
+      logger.warn('SDK', `Model ${modelId} reached daily quota (auto-calibrated RPD to ${this.rpdCounts[modelId]}). Cooldown until ${tomorrow.toISOString()}`);
     } else if (lower.includes('quota exceeded') && (modelId.includes('pro') || lower.includes('billing'))) {
       // Pro models on free key without billing
       this.cooldowns.set(modelId, { untilMs: now + 3600_000, reason: 'Quota unavailable on current plan' });
       reason = 'Quota unavailable on current plan';
-      logger.warn('GEMINI', `Model ${modelId} quota unavailable on free tier; cooled down for 1h`);
+      logger.warn('SDK', `Model ${modelId} quota unavailable on free tier; cooled down for 1h`);
     } else {
       // Standard RPM or TPM 429
       if (retryAfterMs) {
@@ -570,11 +654,11 @@ export class RateLimitTracker {
         cooldownMs = Math.min(60_000, Math.max(15_000, 60_000 - (now % 60_000)));
       }
       this.cooldowns.set(modelId, { untilMs: now + cooldownMs, reason });
-      logger.warn('GEMINI', `Model ${modelId} entered cooldown for ${(cooldownMs / 1000).toFixed(0)}s (${reason})`);
+      logger.warn('SDK', `Model ${modelId} entered cooldown for ${(cooldownMs / 1000).toFixed(0)}s (${reason})`);
     }
 
     // Try to find fallback
-    const selection = this.selectBestAvailableModel(modelId);
+    const selection = this.selectBestAvailableModel(DynamicModelRegistry.getInstance().getModel(modelId) ? modelId : 'auto');
     if (selection.selectedModel.id !== modelId) {
       this.lastSwitchEvent = {
         fromModel: modelId,
@@ -583,7 +667,7 @@ export class RateLimitTracker {
         timestamp: now,
       };
       this.activeModelId = selection.selectedModel.id;
-      logger.info('GEMINI', `Auto-switched model from ${modelId} to ${selection.selectedModel.id} due to ${reason}`);
+      logger.info('SDK', `Auto-switched model from ${modelId} to ${selection.selectedModel.id} due to ${reason}`);
       this.notifyChange();
       return { fallbackRecommended: true, nextModel: selection.selectedModel, reason };
     }
@@ -594,6 +678,7 @@ export class RateLimitTracker {
 
   public getStatus(): GeminiRateLimitsStatus {
     const now = Date.now();
+    const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
     const registry = DynamicModelRegistry.getInstance();
     const rawCascade = registry.getCascade();
     const cascade = rawCascade.map(m => ({ ...m, ...getTierLimits(m, this.tier) }));
@@ -625,11 +710,13 @@ export class RateLimitTracker {
       provider: 'gemini',
       tier: this.tier,
       activeModel: this.activeModelId,
-      autoFallback: this.autoFallbackEnabled,
+      configuredModel: settings.CLAUDE_MEM_GEMINI_MODEL || 'auto',
+      autoFallback: settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== 'false',
       models: modelsStatus,
       cascade,
       queue: this.queueState,
       lastUpdated: now,
+      dailyResetAtMs: nextDailyResetAtMs(now),
       lastSwitchEvent: this.lastSwitchEvent,
     };
   }
@@ -639,7 +726,7 @@ export class RateLimitTracker {
       try {
         this.onStatusChange(this.getStatus());
       } catch (err) {
-        logger.debug('GEMINI', 'Error notifying status change', err as Error);
+        logger.debug('SDK', 'Error notifying status change', err as Error);
       }
     }
   }

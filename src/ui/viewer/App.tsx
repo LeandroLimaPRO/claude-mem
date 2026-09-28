@@ -63,6 +63,8 @@ export function App() {
     setLogsModalOpen(prev => !prev);
   }, []);
 
+  const closeGeminiModal = useCallback(() => setGeminiModalOpen(false), []);
+
   const handleLoadMore = useCallback(async () => {
     try {
       const [newObservations, newSummaries, newPrompts] = await Promise.all([
@@ -109,6 +111,7 @@ export function App() {
           setWelcomeDismissed(false);
         }}
         geminiStatus={geminiStatus}
+        selectedProvider={settings.CLAUDE_MEM_PROVIDER}
         onOpenGeminiStatus={() => setGeminiModalOpen(true)}
       />
 
@@ -136,9 +139,14 @@ export function App() {
 
       <GeminiStatusModal
         isOpen={geminiModalOpen}
-        onClose={() => setGeminiModalOpen(false)}
+        onClose={closeGeminiModal}
         geminiStatus={geminiStatus}
         onRefresh={fetchGeminiStatus}
+        onRediscover={async () => {
+          const response = await fetch('/api/gemini/refresh', { method: 'POST' });
+          if (!response.ok) throw new Error(`Gemini refresh failed (${response.status})`);
+          await fetchGeminiStatus();
+        }}
       />
 
       <button

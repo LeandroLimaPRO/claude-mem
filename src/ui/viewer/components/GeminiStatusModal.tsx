@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import type { GeminiRateLimitsStatus, ModelUsageState } from '../types';
 
 interface GeminiStatusModalProps {
@@ -6,17 +6,12 @@ interface GeminiStatusModalProps {
   onClose: () => void;
   geminiStatus: GeminiRateLimitsStatus | null;
   onRefresh: () => Promise<void>;
+  onRediscover: () => Promise<void>;
 }
 
-function calculateUtcResetCountdown(): string {
-  const now = new Date();
-  const nextReset = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate() + 1,
-    0, 0, 0, 0
-  ));
-  const diffMs = Math.max(0, nextReset.getTime() - now.getTime());
+function calculateResetCountdown(resetAtMs?: number): string {
+  if (!resetAtMs) return '--';
+  const diffMs = Math.max(0, resetAtMs - Date.now());
   const hours = Math.floor(diffMs / (1000 * 60 * 60));
   const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
   return `${hours}h ${minutes.toString().padStart(2, '0')}m`;
@@ -27,23 +22,29 @@ export function GeminiStatusModal({
   onClose,
   geminiStatus,
   onRefresh,
+  onRediscover,
 }: GeminiStatusModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const [error, setError] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'pro' | 'flash' | 'gemma' | 'omni' | 'lite'>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [countdownSeconds, setCountdownSeconds] = useState<number>(0);
-  const [utcResetTime, setUtcResetTime] = useState<string>(calculateUtcResetCountdown());
+  const [dailyResetCountdown, setDailyResetCountdown] = useState<string>('--');
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [calibratedValue, setCalibratedValue] = useState<string>('');
   const [isSubmittingCalibration, setIsSubmittingCalibration] = useState(false);
   const [isSubmittingTier, setIsSubmittingTier] = useState(false);
 
   useEffect(() => {
+    const update = () => setDailyResetCountdown(calculateResetCountdown(geminiStatus?.dailyResetAtMs));
+    update();
     const timer = setInterval(() => {
-      setUtcResetTime(calculateUtcResetCountdown());
+      update();
     }, 30000);
     return () => clearInterval(timer);
-  }, []);
+  }, [geminiStatus?.dailyResetAtMs]);
 
   useEffect(() => {
     if (geminiStatus?.queue.isWaitingForQuota && geminiStatus.queue.quotaWaitRemainingMs > 0) {
@@ -60,13 +61,21 @@ export function GeminiStatusModal({
   }, [countdownSeconds]);
 
   useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
+    if (!isOpen) return;
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
+    dialogRef.current?.querySelector<HTMLElement>('button')?.focus();
+    const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
+      if (e.key !== 'Tab') return;
+      const controls = dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), a[href]');
+      if (!controls?.length) return;
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     };
-    if (isOpen) {
-      window.addEventListener('keydown', handleEsc);
-      return () => window.removeEventListener('keydown', handleEsc);
-    }
+    document.addEventListener('keydown', handleKey);
+    return () => { document.removeEventListener('keydown', handleKey); returnFocusRef.current?.focus(); };
   }, [isOpen, onClose]);
 
   const cascade = useMemo(() => geminiStatus?.cascade || [], [geminiStatus?.cascade]);
@@ -100,60 +109,65 @@ export function GeminiStatusModal({
 
   const handleRefreshClick = async () => {
     setIsRefreshing(true);
+    setError('');
     try {
-      const response = await fetch('/api/gemini/refresh', { method: 'POST' });
-      if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
-      await onRefresh();
-    } catch (err) {
-      console.error('Failed to rediscover models', err);
+      await onRediscover();
+    } catch {
+      setError('Não foi possível redescobrir os modelos. Tente novamente.');
     } finally {
       setIsRefreshing(false);
     }
   };
 
   const handleModelSelect = async (modelId: string) => {
+    setError('');
     try {
-      await fetch('/api/gemini/model', {
+      const response = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelId }),
+        body: JSON.stringify({ CLAUDE_MEM_GEMINI_MODEL: modelId }),
       });
+      if (!response.ok) throw new Error(`Could not save Gemini model (${response.status})`);
       await onRefresh();
-    } catch (e) {
-      console.error('Failed to select model', e);
+    } catch {
+      setError('Não foi possível salvar o modelo. Tente novamente.');
     }
   };
 
   const handleToggleAutoFallback = async () => {
     if (!geminiStatus) return;
+    setError('');
     try {
-      await fetch('/api/gemini/model', {
+      const response = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ autoFallback: !geminiStatus.autoFallback }),
+        body: JSON.stringify({ CLAUDE_MEM_GEMINI_AUTO_FALLBACK: String(!geminiStatus.autoFallback) }),
       });
+      if (!response.ok) throw new Error(`Could not save Gemini fallback (${response.status})`);
       await onRefresh();
-    } catch (e) {
-      console.error('Failed to toggle auto fallback', e);
+    } catch {
+      setError('Não foi possível salvar a cascata. Tente novamente.');
     }
   };
 
   const handleCalibrateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const count = parseInt(calibratedValue, 10);
-    if (isNaN(count) || count < 0) return;
+    const count = Number(calibratedValue);
+    if (!Number.isSafeInteger(count) || count < 0 || calibratedValue.trim() === '') { setError('Informe uma contagem inteira não negativa.'); return; }
+    setError('');
     setIsSubmittingCalibration(true);
     try {
-      await fetch('/api/gemini/calibrate-rpd', {
+      const response = await fetch('/api/gemini/calibrate-rpd', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: activeModel, count }),
       });
+      if (!response.ok) throw new Error(`Calibration failed (${response.status})`);
       setIsCalibrating(false);
       setCalibratedValue('');
       await onRefresh();
-    } catch (err) {
-      console.error('Failed to calibrate RPD', err);
+    } catch {
+      setError('Não foi possível calibrar a cota. Tente novamente.');
     } finally {
       setIsSubmittingCalibration(false);
     }
@@ -161,15 +175,17 @@ export function GeminiStatusModal({
 
   const handleTierSelect = async (tier: 'free' | 'payg') => {
     setIsSubmittingTier(true);
+    setError('');
     try {
-      await fetch('/api/gemini/tier', {
+      const response = await fetch('/api/gemini/tier', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tier }),
       });
+      if (!response.ok) throw new Error(`Tier failed (${response.status})`);
       await onRefresh();
-    } catch (err) {
-      console.error('Failed to set plan tier', err);
+    } catch {
+      setError('Não foi possível salvar o plano. Tente novamente.');
     } finally {
       setIsSubmittingTier(false);
     }
@@ -223,13 +239,13 @@ export function GeminiStatusModal({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="gemini-modal-container" onClick={e => e.stopPropagation()}>
+      <div className="gemini-modal-container" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="gemini-modal-title" onClick={e => e.stopPropagation()}>
         {/* Modal Header */}
         <div className="gemini-modal-header">
           <div className="gemini-header-titles">
             <div className="gemini-header-main-title">
               <span className="gemini-sparkle-icon">⚡</span>
-              <h2>Gemini Dynamic Engine & Rate Limiter</h2>
+              <h2 id="gemini-modal-title">Gemini Dynamic Engine & Rate Limiter</h2>
             </div>
             <p className="gemini-header-sub">
               Monitoramento dinâmico em tempo real de limites (RPD, RPM, TPM), fila resiliente e cascata adaptativa
@@ -256,6 +272,8 @@ export function GeminiStatusModal({
             </button>
           </div>
         </div>
+
+        {error && <p role="alert" className="gemini-control-error">{error}</p>}
 
         {/* Modal Body with dedicated flex column layout */}
         <div className="gemini-modal-body">
@@ -326,7 +344,7 @@ export function GeminiStatusModal({
                         className={`tier-pill ${(!geminiStatus?.tier || geminiStatus.tier === 'free') ? 'active' : ''}`}
                         onClick={() => handleTierSelect('free')}
                         disabled={isSubmittingTier}
-                        title="Google AI Studio Free Tier (gratuito: Flash-Lite 500 RPD, Pro 50 RPD)"
+                        title="Estimativa local de cota gratuita; confirme os limites do seu projeto no Google AI Studio"
                       >
                         Free Tier
                       </button>
@@ -335,7 +353,7 @@ export function GeminiStatusModal({
                         className={`tier-pill ${geminiStatus?.tier === 'payg' ? 'active' : ''}`}
                         onClick={() => handleTierSelect('payg')}
                         disabled={isSubmittingTier}
-                        title="Google AI Studio Pay-As-You-Go (pago: Flash-Lite 4,000 RPD, Pro 1,000 RPD)"
+                        title="Estimativa local de cota paga; esta opção não altera seu plano no Google"
                       >
                         Pay-As-You-Go
                       </button>
@@ -344,9 +362,9 @@ export function GeminiStatusModal({
                       {rpdPercent >= 85 ? '⚠️ Crítico' : rpdPercent >= 60 ? '⚡ Atenção' : '● Saudável'} • {rpdPercent}% Usado
                     </span>
                   </div>
-                  <div className="rpd-reset-timer" title="A cota diária do Google AI Studio é renovada às 00:00 UTC">
+                  <div className="rpd-reset-timer" title="A cota diária é renovada à meia-noite no fuso America/Los_Angeles">
                     <span className="reset-icon">⏱️</span>
-                    <span>Reseta em <strong>{utcResetTime}</strong> (00:00 UTC)</span>
+                    <span>Reseta em <strong>{dailyResetCountdown}</strong> (00:00 Pacífico)</span>
                   </div>
                 </div>
 
@@ -451,7 +469,7 @@ export function GeminiStatusModal({
 
               <div className="hero-micro-item queue-micro-item">
                 <div className="micro-header">
-                  <span className="micro-label">Fila Resiliente</span>
+                  <span className="micro-label">Fila Gemini (global)</span>
                   {geminiStatus?.queue.isProcessing && (
                     <span className="queue-live-pill">Processando</span>
                   )}
@@ -586,7 +604,7 @@ export function GeminiStatusModal({
                 ) : (
                   filteredCascade.map(model => {
                     const state = geminiStatus?.models[model.id];
-                    const isCurrent = model.id === activeModel;
+                    const isCurrent = model.id === (geminiStatus?.configuredModel ?? activeModel);
                     const modelRpdUsed = state?.rpdUsed ?? 0;
                     const modelRpdLimit = model.rpdLimit || 1500;
                     const modelRpdPct = Math.min(100, Math.round((modelRpdUsed / modelRpdLimit) * 100));
@@ -680,7 +698,7 @@ export function GeminiStatusModal({
             ) : (
               filteredCascade.map(model => {
                 const state = geminiStatus?.models[model.id];
-                const isCurrent = model.id === activeModel;
+                const isCurrent = model.id === (geminiStatus?.configuredModel ?? activeModel);
                 const modelRpdUsed = state?.rpdUsed ?? 0;
                 const modelRpdLimit = model.rpdLimit || 1500;
                 const modelRpdPct = Math.min(100, Math.round((modelRpdUsed / modelRpdLimit) * 100));

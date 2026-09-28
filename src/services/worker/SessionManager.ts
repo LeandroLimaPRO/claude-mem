@@ -326,14 +326,6 @@ export class SessionManager {
     return this.buffer.resetClaimed(sessionDbId);
   }
 
-  /**
-   * Reset claimed messages for a session so they return to pending state.
-   * Alias for resetProcessingToPending to ensure API compatibility.
-   */
-  async resetClaimed(sessionDbId: number): Promise<number> {
-    return this.resetProcessingToPending(sessionDbId);
-  }
-
   async confirmClaimedMessages(sessionDbId: number): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];
@@ -539,34 +531,4 @@ export class SessionManager {
     return this.buffer;
   }
 
-  /**
-   * Re-queue any tool_uses from SQLite that were stored but not yet linked
-   * to an observation (e.g. after worker restart).
-   */
-  requeueUnobservedToolUses(sessionDbId: number): number {
-    try {
-      const db = this.dbManager.getConnection();
-      const rows = db.query(
-        'SELECT tool_name, tool_input, tool_response, cwd, prompt_number, agent_id, agent_type, tool_use_id FROM tool_uses WHERE session_db_id = ? AND observation_id IS NULL ORDER BY id ASC'
-      ).all(sessionDbId) as any[];
-
-      let requeued = 0;
-      for (const row of rows) {
-        this.queueObservation(sessionDbId, {
-          tool_name: row.tool_name,
-          tool_input: row.tool_input ?? '{}',
-          tool_response: row.tool_response ?? '{}',
-          prompt_number: row.prompt_number ?? 1,
-          cwd: row.cwd ?? '',
-          agentId: row.agent_id ?? undefined,
-          agentType: row.agent_type ?? undefined,
-          toolUseId: row.tool_use_id ?? undefined,
-        });
-        requeued++;
-      }
-      return requeued;
-    } catch {
-      return 0;
-    }
-  }
 }
