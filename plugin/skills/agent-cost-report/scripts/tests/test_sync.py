@@ -41,7 +41,7 @@ class Sync(unittest.TestCase):
 
     def test_default_destinations_are_the_house_copy_and_four_mirrors(self):
         d = sync.destinations(repo_root="/r", house="/h")
-        self.assertEqual(d, ["/h"] + [f"/r/{m}/skills/agent-cost-report" for m in ("claude-mem-cursor", "claude-mem-grok-bot", "cowork", "openclaw")])
+        self.assertEqual(d, ["/h"] + [os.path.join("/r", m, "skills", "agent-cost-report") for m in ("claude-mem-cursor", "claude-mem-grok-bot", "cowork", "openclaw")])
 
     def test_cli_exit_code(self):
         r = subprocess.run([sys.executable, _paths.ACR_PY, "sync-check", "--dest", self.dests[0]], capture_output=True, text=True)

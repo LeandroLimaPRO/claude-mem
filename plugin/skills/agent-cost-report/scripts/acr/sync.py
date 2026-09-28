@@ -27,7 +27,7 @@ def shipped_files(root=SKILL_DIR):
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and (dirpath != root or d == "scripts"))
         for f in sorted(files):
-            rel = os.path.relpath(os.path.join(dirpath, f), root)
+            rel = os.path.relpath(os.path.join(dirpath, f), root).replace(os.sep, "/")
             if dirpath == root and f not in ("SKILL.md",): continue
             if f in SKIP_FILES or f.endswith(".pyc"): continue
             out.append(rel)
@@ -44,7 +44,7 @@ def sha256(path):
 def write_checksums(root=SKILL_DIR):
     """sha256sum-compatible CHECKSUMS.txt next to SKILL.md so drift shows in git diffs."""
     lines = [f"{sha256(os.path.join(root, rel))}  {rel}" for rel in shipped_files(root)]
-    with open(os.path.join(root, CHECKSUMS), "w") as fh: fh.write("\n".join(lines) + "\n")
+    with open(os.path.join(root, CHECKSUMS), "w", newline="\n") as fh: fh.write("\n".join(lines) + "\n")
     return lines
 
 

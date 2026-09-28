@@ -52,27 +52,28 @@ def _week_start(t):
 
 def bucket_rule(measured, window_block, now=None):
     """Plan 4.2: pick the UTC bucket (week, else month) whose figure is shown, say whether it fully covers
-    the PT report window (bucket_start_utc <= window_start_utc and now >= window_end_utc), and label it."""
+    the PT report window, and whether its interval matches exactly."""
     if not measured or measured.get("status") != "ok": return None
     fetched = dt.datetime.fromisoformat(measured["fetched_at_utc"]); now = now or fetched
     if window_block.get("start_epoch_ms") is None or window_block.get("end_epoch_ms") is None:      # --session run: no period window
         week0 = _week_start(fetched)
         return dict(bucket="usage_weekly", bucket_start_utc=week0.isoformat(timespec="seconds"), usd=measured.get("usage_weekly"),
-                    label=f"OpenRouter measured, current UTC week {week0.strftime('%a %-d %b')} – now", covers_window=False, window_inside_bucket=False,
-                    note="a session run has no period window; the measured bucket is shown for reference only", note_taker=NOTE_TAKER)
+                    label=f"OpenRouter measured, current UTC week {week0:%a} {week0.day} {week0:%b} – now", covers_window=False, window_inside_bucket=False,
+                    matches_window=False, note="a session run has no period window; the measured bucket is shown for reference only", note_taker=NOTE_TAKER)
     ws = dt.datetime.fromtimestamp(window_block["start_epoch_ms"] / 1000, dt.timezone.utc); we = dt.datetime.fromtimestamp(window_block["end_epoch_ms"] / 1000, dt.timezone.utc)
     week0 = _week_start(fetched); month0 = fetched.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if ws >= week0: name, start, usd = "usage_weekly", week0, measured.get("usage_weekly")
     else: name, start, usd = "usage_monthly", month0, measured.get("usage_monthly")
-    covers = usd is not None and start <= ws and now >= we
-    inside = start <= ws and we <= now + dt.timedelta(seconds=1)
-    label = f"OpenRouter measured, current UTC {'week' if name == 'usage_weekly' else 'month'} {start.strftime('%a %-d %b')} – now"
-    note = None if covers else "measured bucket does not match the report window; shown for reference"
-    return dict(bucket=name, bucket_start_utc=start.isoformat(timespec="seconds"), usd=usd, label=label, covers_window=bool(covers), window_inside_bucket=bool(inside), note=note, note_taker=NOTE_TAKER)
+    covers = usd is not None and start <= ws and fetched >= we
+    matches = usd is not None and start == ws and fetched == we
+    inside = start <= ws and we <= fetched
+    label = f"OpenRouter measured, current UTC {'week' if name == 'usage_weekly' else 'month'} {start:%a} {start.day} {start:%b} – now"
+    note = None if matches else "measured bucket does not match the report window; shown for reference"
+    return dict(bucket=name, bucket_start_utc=start.isoformat(timespec="seconds"), usd=usd, label=label, covers_window=bool(covers), matches_window=bool(matches), window_inside_bucket=bool(inside), note=note, note_taker=NOTE_TAKER)
 
 
 def apply(report, measured, now=None):
-    """Mutates report['spend']: the total switches to MEASURED only when the bucket fully covers the window;
+    """Mutates report['spend']: the total switches to MEASURED only for the same interval;
     line items keep cost_basis estimated_usage (per-session measured cost is not available, plan 4.2)."""
     s = report["spend"]
     if not measured or measured.get("status") != "ok":
@@ -82,7 +83,7 @@ def apply(report, measured, now=None):
         return s
     b = bucket_rule(measured, report["window"], now=now)
     s["measured_reference"] = b
-    if b and b["covers_window"]:
+    if b and b["matches_window"]:
         s["agent_measured_usd"] = round(float(b["usd"]), 2); s["measured_status"] = "ok (period bucket)"; s["measured_label"] = "MEASURED"
     else:
         s["agent_measured_usd"] = None; s["measured_status"] = "reference only (bucket does not cover the window)"
