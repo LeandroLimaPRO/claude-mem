@@ -459,10 +459,9 @@ export class RateLimitTracker {
     // If preferredModel is 'auto', we start from rank 1
     const isAuto = preferredModel === 'auto' || !preferredModel;
     const startIndex = isAuto ? 0 : cascade.findIndex(m => m.id === preferredModel);
-    if (startIndex < 0) {
-      throw new ClassifiedProviderError(`Unknown Gemini model: ${preferredModel}`, { kind: 'unrecoverable', cause: null });
-    }
-    const candidates = isAuto || this.autoFallbackEnabled ? cascade : [cascade[startIndex]];
+    // If preferred model is not found and autoFallback is disabled, treat as if we'll try it
+    // and let the actual request fail; if autoFallback is enabled, use cascade for fallback
+    const candidates = isAuto || this.autoFallbackEnabled || startIndex < 0 ? cascade : [cascade[startIndex]];
     if (candidates.every(m => estimatedTokens > getTierLimits(m, this.tier).tpmLimit || estimatedTokens > m.contextWindow)) {
       throw new ClassifiedProviderError('Gemini request exceeds every available model capacity', { kind: 'unrecoverable', cause: null });
     }
