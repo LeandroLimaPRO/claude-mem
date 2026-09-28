@@ -279,10 +279,19 @@ export class SettingsRoutes extends BaseRouteHandler {
     }
 
     if (settings.CLAUDE_MEM_GEMINI_MODEL !== undefined &&
-        (typeof settings.CLAUDE_MEM_GEMINI_MODEL !== 'string' ||
-         (settings.CLAUDE_MEM_GEMINI_MODEL !== 'auto' &&
-          !DynamicModelRegistry.getInstance().getModel(settings.CLAUDE_MEM_GEMINI_MODEL)))) {
-      return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be auto or a model in the Gemini catalog' };
+        typeof settings.CLAUDE_MEM_GEMINI_MODEL !== 'string') {
+      return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be a string' };
+    }
+
+    // Accept 'auto', any model in the catalog, or any ID matching standard model format
+    // (discovered models may not be in the in-RAM catalog after restart)
+    if (settings.CLAUDE_MEM_GEMINI_MODEL !== undefined &&
+        settings.CLAUDE_MEM_GEMINI_MODEL !== 'auto' &&
+        !DynamicModelRegistry.getInstance().getModel(settings.CLAUDE_MEM_GEMINI_MODEL)) {
+      const modelIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+      if (!modelIdPattern.test(settings.CLAUDE_MEM_GEMINI_MODEL)) {
+        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be auto or a valid model ID' };
+      }
     }
 
     if (settings.CLAUDE_MEM_GEMINI_AUTO_FALLBACK !== undefined &&
