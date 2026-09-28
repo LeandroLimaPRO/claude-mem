@@ -572,6 +572,29 @@ describe('GeminiProvider', () => {
     }
   });
 
+  it('triggers model discovery for a fixed configured model missing from the in-RAM catalog (e.g. after a worker restart)', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalBunTest = process.env.BUN_TEST;
+    delete process.env.NODE_ENV;
+    delete process.env.BUN_TEST;
+    loadFromFileSpy.mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-discovered-but-forgotten',
+      CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',
+      CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
+    }));
+    const discoverSpy = spyOn(DynamicModelRegistry.getInstance(), 'discoverModels').mockResolvedValue([]);
+    try {
+      (agent as any).getGeminiConfig();
+      expect(discoverSpy).toHaveBeenCalledWith('test-api-key');
+    } finally {
+      discoverSpy.mockRestore();
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = originalNodeEnv;
+      if (originalBunTest === undefined) delete process.env.BUN_TEST; else process.env.BUN_TEST = originalBunTest;
+    }
+  });
+
   describe('gemini-3-flash-preview model support', () => {
     it('should accept only currently-available models (no retired 2.x IDs)', async () => {
       const validModels = [

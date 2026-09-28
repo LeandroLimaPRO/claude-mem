@@ -562,8 +562,13 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const defaultModel = 'auto';
     const configuredModel = settings.CLAUDE_MEM_GEMINI_MODEL || defaultModel;
 
-    // Trigger non-blocking dynamic discovery if key is present, model is 'auto', and not in test environment
-    if (apiKey && configuredModel === 'auto' && process.env.NODE_ENV !== 'test' && !process.env.BUN_TEST) {
+    // Trigger non-blocking dynamic discovery if key is present and not in test environment.
+    // Also fires for a fixed configured model the in-RAM catalog doesn't know about
+    // (e.g. a discovered model picked from the panel before a worker restart wiped
+    // the catalog back to DEFAULT_MODEL_CASCADE) so it self-heals instead of
+    // permanently rejecting it as "Unknown Gemini model".
+    if (apiKey && process.env.NODE_ENV !== 'test' && !process.env.BUN_TEST &&
+        (configuredModel === 'auto' || !this.registry.getModel(configuredModel))) {
       void this.registry.discoverModels(apiKey).catch(() => {});
     }
 
