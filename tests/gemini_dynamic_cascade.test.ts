@@ -35,7 +35,7 @@ describe('Gemini dynamic cascade regressions', () => {
   });
 
   it('reaches Flash after all four Pro candidates fail', async () => {
-    const result = await (provider as any).query(history, config);
+    const result = await (provider as any).executeWithDynamicCascade(history, config);
     expect(result.servedModel).toBe('gemini-flash-latest');
     expect(new Set(models).size).toBe(5);
   });
@@ -45,7 +45,7 @@ describe('Gemini dynamic cascade regressions', () => {
       models.push(String(url).split('/models/')[1].split(':')[0]);
       return new Response('not found', { status: 404 });
     });
-    await expect((provider as any).query(history, config)).rejects.toThrow();
+    await expect((provider as any).executeWithDynamicCascade(history, config)).rejects.toThrow();
     expect(models).toEqual(registry.getCascade().map(model => model.id));
   });
 
@@ -57,7 +57,7 @@ describe('Gemini dynamic cascade regressions', () => {
       controller.abort();
       throw new Error('cancelled');
     });
-    await expect((provider as any).query(history, config, controller.signal)).rejects.toThrow();
+    await expect((provider as any).executeWithDynamicCascade(history, config, controller.signal)).rejects.toThrow();
     expect(requestSignal?.aborted).toBe(true);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
@@ -71,7 +71,7 @@ describe('Gemini dynamic cascade regressions', () => {
           ? new Response('unavailable', { status })
           : Response.json({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
       });
-      const result = await (provider as any).query(history, { ...config, model: 'gemini-flash-latest' });
+      const result = await (provider as any).executeWithDynamicCascade(history, { ...config, model: 'gemini-flash-latest' });
       expect(result.content).toBe('ok');
       expect(models).toEqual(['gemini-flash-latest', 'gemini-pro-latest']);
     });
@@ -80,7 +80,7 @@ describe('Gemini dynamic cascade regressions', () => {
   it('sends no request when the field deadline has already expired', async () => {
     const controller = new AbortController();
     controller.abort();
-    await expect((provider as any).query(history, {
+    await expect((provider as any).executeWithDynamicCascade(history, {
       ...config, model: 'gemini-flash-latest', rateLimitingEnabled: false, autoFallback: false,
     }, controller.signal)).rejects.toThrow();
     expect(models).toEqual([]);
@@ -91,7 +91,7 @@ describe('Gemini dynamic cascade regressions', () => {
       models.push('failed');
       return new Response('internal error', { status: 500 });
     });
-    await expect((provider as any).query(history, {
+    await expect((provider as any).executeWithDynamicCascade(history, {
       ...config, model: 'gemini-flash-latest', rateLimitingEnabled: false, autoFallback: false,
     }, new AbortController().signal)).rejects.toThrow();
     expect(models.length).toBe(1);
@@ -103,7 +103,7 @@ describe('Gemini dynamic cascade regressions', () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10);
     try {
-      await expect((provider as any).query(history, {
+      await expect((provider as any).executeWithDynamicCascade(history, {
         ...config, model: 'gemini-flash-latest', autoFallback: false,
       }, controller.signal)).rejects.toThrow();
       expect(models).toEqual([]);
@@ -118,7 +118,7 @@ describe('Gemini dynamic cascade regressions', () => {
       models.push(String(url).split('/models/')[1].split(':')[0]);
       return Response.json({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
     });
-    const result = await (provider as any).query(history, {
+    const result = await (provider as any).executeWithDynamicCascade(history, {
       ...config, rateLimitingEnabled: false, autoFallback: false,
     });
     expect(models).toEqual(['gemini-pro-latest']);
@@ -141,7 +141,7 @@ describe('Gemini dynamic cascade regressions', () => {
       return Response.json({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] });
     });
     try {
-      const result = await (provider as any).query(history, { ...config, model, autoFallback: false });
+      const result = await (provider as any).executeWithDynamicCascade(history, { ...config, model, autoFallback: false });
       expect(result.content).toBe('ok');
       expect(waits).toEqual([60_000, 60_000, 5_000]);
     } finally {
