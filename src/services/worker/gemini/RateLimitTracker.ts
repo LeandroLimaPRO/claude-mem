@@ -635,7 +635,13 @@ export class RateLimitTracker {
       this.cooldowns.set(modelId, { untilMs: now + 300_000, reason: 'Blocked by safety filters' });
       reason = 'Blocked by safety filters';
       logger.warn('SDK', `Model ${modelId} output blocked by safety filters, cooling down for 5m`);
-    } else if (lower.includes('daily') || lower.includes('requests per day') || lower.includes('rpd')) {
+    } else if (
+      lower.includes('daily') || lower.includes('requests per day') || lower.includes('rpd') ||
+      // Structured QuotaFailure violations carry a quotaId like
+      // "GenerateRequestsPerDayPerProjectPerModel-FreeTier" with no "daily"/"rpd"
+      // wording anywhere in the message text, so the checks above miss it.
+      lower.includes('perday')
+    ) {
       const tomorrow = new Date(nextDailyResetAtMs(now));
       cooldownMs = tomorrow.getTime() - now;
       reason = 'Daily quota exhausted';

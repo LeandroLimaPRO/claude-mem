@@ -296,6 +296,30 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       expect(tracker.getModelStatus(model).status).toBe('exhausted');
     });
 
+    it('recognizes a structured QuotaFailure PerDay violation with no "daily"/"rpd" wording in the message', () => {
+      const model = 'gemini-flash-lite-latest';
+      tracker.calibrateRpd(model, 250);
+      expect(tracker.getRpdUsed(model)).toBe(250);
+
+      // Real Gemini QuotaFailure body: the message text alone says nothing
+      // about "daily"/"requests per day"/"rpd" — only the quotaId does.
+      const body = JSON.stringify({
+        error: {
+          code: 429,
+          message: 'You exceeded your current quota, please check your plan and billing details.',
+          status: 'RESOURCE_EXHAUSTED',
+          details: [{
+            '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+            violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }],
+          }],
+        },
+      });
+
+      tracker.recordRequestFailure(model, 429, body);
+      expect(tracker.getRpdUsed(model)).toBe(500);
+      expect(tracker.getModelStatus(model).status).toBe('exhausted');
+    });
+
     it('sweeps stale sliding-window records and expired cooldowns from RAM', () => {
       const now = Date.now();
       const modelA = 'test-model-a';
