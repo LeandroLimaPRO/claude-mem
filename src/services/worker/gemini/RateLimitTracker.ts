@@ -399,7 +399,11 @@ export class RateLimitTracker {
     if (!check.allowed) return { waitMs: check.waitMs, reason: check.reason };
     const reservation = { id: String(++this.nextReservationId), model: modelId, estimatedTokens: estimatedInputTokens, timestamp: now };
     this.reservations.set(reservation.id, reservation);
-    this.updateQueueState({ isProcessing: true, depth: this.reservations.size });
+    // depth tracks the session buffer's pending-observation count (see
+    // SessionManager's updateQueueState({ depth }) call), not in-flight
+    // reservations — overwriting it here made the UI badge show request
+    // concurrency instead of how many observations are actually queued.
+    this.updateQueueState({ isProcessing: true });
     this.rpmTimestamps.set(modelId, [...(this.rpmTimestamps.get(modelId) ?? []), now]);
     this.tpmRecords.set(modelId, [...(this.tpmRecords.get(modelId) ?? []), { timestamp: now, tokens: estimatedInputTokens }]);
     this.rpdCounts[modelId] = (this.rpdCounts[modelId] ?? 0) + 1;
@@ -410,7 +414,8 @@ export class RateLimitTracker {
 
   public reconcileReservation(reservation: TokenReservation, actualInputTokens?: number, sent = true, success = false): void {
     if (!this.reservations.delete(reservation.id)) return;
-    this.updateQueueState({ isProcessing: this.reservations.size > 0, depth: this.reservations.size });
+    // See tryReserve: depth belongs to the session buffer, not this count.
+    this.updateQueueState({ isProcessing: this.reservations.size > 0 });
     const modelId = reservation.model;
     const tokens = this.tpmRecords.get(modelId) ?? [];
     const tokenIndex = tokens.findIndex(r => r.timestamp === reservation.timestamp && r.tokens === reservation.estimatedTokens);

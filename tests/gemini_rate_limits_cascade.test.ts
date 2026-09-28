@@ -214,6 +214,22 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       expect(status.models[status.activeModel]).toBeDefined();
     });
 
+    it('does not let in-flight reservations overwrite the session buffer depth', () => {
+      const model = 'gemini-3.7-flash';
+      // SessionManager reports how many observations are actually buffered
+      // (independent of how many requests are in flight).
+      tracker.updateQueueState({ depth: 10 });
+
+      const { reservation } = tracker.tryReserve(model, 100);
+      expect(reservation).toBeDefined();
+      expect(tracker.getStatus().queue.depth).toBe(10);
+      expect(tracker.getStatus().queue.isProcessing).toBe(true);
+
+      tracker.reconcileReservation(reservation!, 100, true, true);
+      expect(tracker.getStatus().queue.depth).toBe(10);
+      expect(tracker.getStatus().queue.isProcessing).toBe(false);
+    });
+
     it('sets accurate baseline limits for Flash-Lite (500 RPD) and Flash Preview (500 RPD)', () => {
       const registry = DynamicModelRegistry.getInstance();
       const flashLiteLatest = registry.getModel('gemini-flash-lite-latest')!;
