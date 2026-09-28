@@ -2,6 +2,7 @@ import { describe, it, expect, mock, afterEach, spyOn } from 'bun:test';
 import * as timers from 'node:timers/promises';
 import { GeminiProvider } from '../../src/services/worker/GeminiProvider.js';
 import { RateLimitTracker } from '../../src/services/worker/gemini/RateLimitTracker.js';
+import { DynamicModelRegistry } from '../../src/services/worker/gemini/DynamicModelRegistry.js';
 
 const tracker = RateLimitTracker.getInstance();
 const originalFetch = global.fetch;
@@ -166,5 +167,46 @@ describe('Gemini admission', () => {
     const result = await query('gemini-pro-latest');
     expect(tracker.getTpmUsed('gemini-pro-latest')).toBe(100);
     expect(result.tokensUsed).toBe(1000);
+  });
+
+  it('waits out a cooldown instead of aborting when the cascade falls back to an already-tried model', async () => {
+    tracker.resetAllCounters();
+    tracker.setAutoFallback(true);
+    let now = Date.now();
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    const cascade = DynamicModelRegistry.getInstance().getCascade();
+    const [modelA, modelB, ...rest] = cascade;
+    // Only modelA and modelB stay viable; every other candidate is parked far
+    // in the future so selectBestAvailableModel's fallback keeps landing back
+    // on modelA/modelB once both take a 429.
+    for (const m of rest) tracker.setCooldown(m.id, 24 * 60 * 60 * 1000, 'test');
+    const waits: Array<{ ms: number; resume: () => void }> = [];
+    const sleep = spyOn(timers, 'setTimeout').mockImplementation((ms => new Promise<void>(resolve => {
+      waits.push({ ms: Number(ms), resume: () => { now += Number(ms); resolve(); } });
+    })) as any);
+    let calls = 0;
+    global.fetch = mock(async () => {
+      calls++;
+      if (calls <= 2) return new Response('rate limit', { status: 429, headers: { 'retry-after': '1' } });
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }));
+    });
+    try {
+      const pending = query(modelA.id, undefined, 'observe', true, true);
+      // Let the two 429 responses and the cascade's fallback bookkeeping run
+      // before the admission wait registers its (mocked) sleep.
+      for (let i = 0; i < 10 && waits.length === 0; i++) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      expect(waits.length).toBeGreaterThan(0);
+      waits[0].resume();
+      const result = await pending;
+      expect((result as any).content).toBe('ok');
+      // 2 failed attempts (modelA, modelB) + 1 successful retry once the
+      // shared 1s cooldown clears — never an immediate throw.
+      expect(calls).toBe(3);
+    } finally {
+      sleep.mockRestore();
+      clock.mockRestore();
+    }
   });
 });

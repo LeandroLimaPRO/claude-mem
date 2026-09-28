@@ -394,7 +394,12 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
                 throw new ClassifiedProviderError(`Unknown Gemini model: ${targetModelId}`, { kind: 'unrecoverable', cause: null });
               }
             }
-            if (attemptedModels.has(targetModelId)) {
+            // With rate limiting enabled, targetModelId comes from waitForReservation's
+            // live admission check (cooldowns/unsupported set), so a model that clears
+            // its cooldown is legitimately retryable even if it's in attemptedModels.
+            // Without rate limiting there's no admission wait, so repeating a rejected
+            // model here would just spin without backoff.
+            if (!config.rateLimitingEnabled && attemptedModels.has(targetModelId)) {
               throw new ClassifiedProviderError('Gemini cascade repeated a rejected model', { kind: 'unrecoverable', cause: null });
             }
             const url = `${GEMINI_API_URL}/${encodeURIComponent(targetModelId)}:generateContent?key=${config.apiKey}`;
@@ -534,7 +539,10 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
           );
           currentModelId = nextModel;
           attemptedModels.add(targetModelId);
-          if (attemptedModels.has(nextModel)) {
+          // Same distinction as above: only bail out here when there's no admission
+          // wait to fall back on. With rate limiting enabled, looping back lets
+          // waitForReservation wait out the cooldown instead of giving up early.
+          if (!config.rateLimitingEnabled && attemptedModels.has(nextModel)) {
             throw lastErr;
           }
           continue; // Retry with next model
