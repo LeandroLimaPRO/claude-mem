@@ -377,7 +377,9 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     const attemptedModels = new Set<string>();
     let currentModelId = config.model;
     let targetModelId = currentModelId;
-      let priorRequestId: string | null = null;
+    let priorRequestId: string | null = null;
+    let cascadeLoops = 0;
+    let lastRequestDependentError: ClassifiedProviderError | null = null;
     while (true) {
       signal?.throwIfAborted();
       let reservation: TokenReservation | undefined;
@@ -439,6 +441,10 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
                 errorLower.includes('restricted') ||
                 errorLower.includes('waitlist'));
 
+            const isRequestDependentError =
+              (response.status === 400 && (badReqCategory === 'context_limit' || badReqCategory === 'unknown_bad_request')) ||
+              response.status === 422;
+
             const isCascadeTrigger =
               response.status === 429 ||
               response.status === 404 ||
@@ -450,6 +456,12 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
 
             // If a fallback model is available, error is a cascade trigger, and auto-fallback is enabled, signal fallback
             if (config.autoFallback && isCascadeTrigger) {
+              // Request-dependent errors (context_limit, 422, unknown 400) should not cascade beyond 1 full loop
+              if (isRequestDependentError && cascadeLoops > 0) {
+                lastRequestDependentError = classified;
+                throw classified;
+              }
+
               const failureAnalysis = this.tracker.recordRequestFailure(
                 targetModelId,
                 response.status,
@@ -483,7 +495,6 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
         }, {
           label: `Gemini ${targetModelId}`,
           abortSignal: signal,
-          ...(signal ? { maxRetries: 0 } : {}),
           beforeAttempt: config.rateLimitingEnabled ? async waitSignal => {
             const admission = await this.waitForReservation(currentModelId, estimatedTokens, waitSignal);
             targetModelId = admission.modelId;
@@ -502,15 +513,17 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             200,
             'Blocked by safety filters'
           );
-          if (failureAnalysis.fallbackRecommended && failureAnalysis.nextModel) {
+          // Safety block is request-dependent, mark it
+          lastRequestDependentError = new ClassifiedProviderError(
+            `Gemini output blocked by safety filters on ${targetModelId}`,
+            { kind: 'unrecoverable', cause: new Error('Safety block') }
+          );
+          if (failureAnalysis.fallbackRecommended && failureAnalysis.nextModel && cascadeLoops < 1) {
             const fallbackErr = new Error(`FALLBACK_TO_${failureAnalysis.nextModel.id}`);
             (fallbackErr as any).isFallback = true;
             (fallbackErr as any).nextModelId = failureAnalysis.nextModel.id;
             (fallbackErr as any).reason = 'Blocked by safety filters';
-            (fallbackErr as any).lastError = new ClassifiedProviderError(
-              `Gemini output blocked by safety filters on ${targetModelId}`,
-              { kind: 'unrecoverable', cause: new Error('Safety block') }
-            );
+            (fallbackErr as any).lastError = lastRequestDependentError;
             throw fallbackErr;
           }
         }
@@ -538,7 +551,15 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             fallbackReason
           );
           currentModelId = nextModel;
+          // Track when we complete a full cascade loop (revisiting a model)
+          if (attemptedModels.has(nextModel)) {
+            cascadeLoops++;
+          }
           attemptedModels.add(targetModelId);
+          // Bail out if this was a request-dependent error and we've cycled through all models once
+          if (lastRequestDependentError && cascadeLoops > 0) {
+            throw lastRequestDependentError;
+          }
           // Same distinction as above: only bail out here when there's no admission
           // wait to fall back on. With rate limiting enabled, looping back lets
           // waitForReservation wait out the cooldown instead of giving up early.
