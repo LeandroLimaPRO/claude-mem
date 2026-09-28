@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import type { GeminiRateLimitsStatus, ModelUsageState } from '../types';
+import type { GeminiRateLimitsStatus, ModelUsageState, Settings } from '../types';
 
 interface GeminiStatusModalProps {
   isOpen: boolean;
@@ -7,6 +7,10 @@ interface GeminiStatusModalProps {
   geminiStatus: GeminiRateLimitsStatus | null;
   onRefresh: () => Promise<void>;
   onRediscover: () => Promise<void>;
+  /** Mirrors a save this modal already POSTed into useSettings' local state,
+   * so a later save from ContextSettingsModal doesn't resubmit a stale copy
+   * and revert it. */
+  onSettingsPatched: (patch: Partial<Settings>) => void;
 }
 
 function calculateResetCountdown(resetAtMs?: number): string {
@@ -23,6 +27,7 @@ export function GeminiStatusModal({
   geminiStatus,
   onRefresh,
   onRediscover,
+  onSettingsPatched,
 }: GeminiStatusModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
@@ -128,6 +133,7 @@ export function GeminiStatusModal({
         body: JSON.stringify({ CLAUDE_MEM_GEMINI_MODEL: modelId }),
       });
       if (!response.ok) throw new Error(`Could not save Gemini model (${response.status})`);
+      onSettingsPatched({ CLAUDE_MEM_GEMINI_MODEL: modelId });
       await onRefresh();
     } catch {
       setError('Não foi possível salvar o modelo. Tente novamente.');
@@ -144,6 +150,7 @@ export function GeminiStatusModal({
         body: JSON.stringify({ CLAUDE_MEM_GEMINI_AUTO_FALLBACK: String(!geminiStatus.autoFallback) }),
       });
       if (!response.ok) throw new Error(`Could not save Gemini fallback (${response.status})`);
+      onSettingsPatched({ CLAUDE_MEM_GEMINI_AUTO_FALLBACK: String(!geminiStatus.autoFallback) });
       await onRefresh();
     } catch {
       setError('Não foi possível salvar a cascata. Tente novamente.');

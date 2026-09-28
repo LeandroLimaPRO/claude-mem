@@ -66,5 +66,14 @@ export function useSettings() {
     setIsSaving(false);
   };
 
-  return { settings, saveSettings, isSaving, saveStatus };
+  // Merges a patch already persisted elsewhere (e.g. GeminiStatusModal's own
+  // POST to /api/settings) into local state, without re-submitting it. Without
+  // this, this hook's `settings` stays stale after such a save, and the next
+  // saveSettings() call from ContextSettingsModal POSTs the whole stale object,
+  // silently reverting the other write.
+  const updateSettings = (patch: Partial<Settings>) => {
+    setSettings(prev => ({ ...prev, ...patch }));
+  };
+
+  return { settings, saveSettings, updateSettings, isSaving, saveStatus };
 }

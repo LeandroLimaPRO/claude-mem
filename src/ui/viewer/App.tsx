@@ -23,7 +23,7 @@ export function App() {
   const [paginatedPrompts, setPaginatedPrompts] = useState<UserPrompt[]>([]);
 
   const { observations, summaries, prompts, projects, isProcessing, queueDepth, geminiStatus, fetchGeminiStatus } = useSSE();
-  const { settings, saveSettings, isSaving, saveStatus } = useSettings();
+  const { settings, saveSettings, updateSettings, isSaving, saveStatus } = useSettings();
   const { preference, setThemePreference } = useTheme();
   const pagination = usePagination(currentFilter);
 
@@ -142,6 +142,7 @@ export function App() {
         onClose={closeGeminiModal}
         geminiStatus={geminiStatus}
         onRefresh={fetchGeminiStatus}
+        onSettingsPatched={updateSettings}
         onRediscover={async () => {
           const response = await fetch('/api/gemini/refresh', { method: 'POST' });
           if (!response.ok) throw new Error(`Gemini refresh failed (${response.status})`);
