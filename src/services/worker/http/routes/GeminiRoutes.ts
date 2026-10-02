@@ -6,6 +6,7 @@ import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsMana
 import { paths } from '../../../../shared/paths.js';
 import { getCredential } from '../../../../shared/EnvManager.js';
 import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
+import { logger } from '../../../../utils/logger.js';
 
 export class GeminiRoutes extends BaseRouteHandler {
   constructor() {
@@ -34,7 +35,8 @@ export class GeminiRoutes extends BaseRouteHandler {
     const registry = DynamicModelRegistry.getInstance();
     try {
       await registry.discoverModels(apiKey, true, true);
-    } catch {
+    } catch (error) {
+      logger.warn('GEMINI', 'Manual model discovery failed; catalog retained', {}, error);
       res.status(502).json({ error: 'Gemini model discovery failed; catalog retained' });
       return;
     }

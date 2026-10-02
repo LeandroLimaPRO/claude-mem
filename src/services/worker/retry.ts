@@ -138,7 +138,8 @@ export async function withRetry<T>(
       throw new Error('Aborted');
     }
 
-    await options.beforeAttempt?.(options.abortSignal);
+    // Skip the await when unset: an empty await reorders timer arming for callers without admission.
+    if (options.beforeAttempt) await options.beforeAttempt(options.abortSignal);
 
     // Per-attempt timeout via AbortController. Forward external aborts too.
     const attemptController = new AbortController();
