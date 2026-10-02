@@ -60,6 +60,13 @@ describe('SessionRoutes failed batch lifecycle', () => {
     expect(h.startSession).toHaveBeenCalledTimes(2);
   });
 
+  it('finalizes instead of re-sending a batch the provider classified as unrecoverable', async () => {
+    const h = harness(true, new ClassifiedProviderError('HTTP 400 bad request', { kind: 'unrecoverable', cause: null }));
+    await (h.routes as any).startGeneratorWithProvider(h.session, 'gemini', 'test', null);
+    await h.session.generatorPromise;
+    expect(h.finalizeSession).toHaveBeenCalledWith(4147);
+  });
+
   it('still finalizes a successful idle generator', async () => {
     const h = harness(false);
     await (h.routes as any).startGeneratorWithProvider(h.session, 'claude', 'test', null);

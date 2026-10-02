@@ -93,7 +93,7 @@ describe('Gemini dynamic cascade regressions', () => {
     });
     await expect((provider as any).executeWithDynamicCascade(history, {
       ...config, model: 'gemini-flash-latest', rateLimitingEnabled: false, autoFallback: false,
-    }, new AbortController().signal)).rejects.toThrow();
+    }, new AbortController().signal, true)).rejects.toThrow();
     expect(models.length).toBe(1);
   });
 

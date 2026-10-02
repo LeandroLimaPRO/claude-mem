@@ -44,9 +44,13 @@ describe('Gemini settings round trip', () => {
     expect(h.get().value.CLAUDE_MEM_GEMINI_MODEL).toBe('gemini-3.1-pro-preview');
   });
 
-  it('rejects unknown models and invalid fallback values', () => {
+  it('accepts a well-formed model ID missing from the in-RAM catalog (discovered before restart)', () => {
+    expect(handlers().post({ CLAUDE_MEM_GEMINI_MODEL: 'gemini-discovered-9' }).code).toBe(200);
+  });
+
+  it('rejects malformed models and invalid fallback values', () => {
     const h = handlers();
-    expect(h.post({ CLAUDE_MEM_GEMINI_MODEL: 'unknown-model' }).code).toBe(400);
+    expect(h.post({ CLAUDE_MEM_GEMINI_MODEL: 'bad model!' }).code).toBe(400);
     expect(h.post({ CLAUDE_MEM_GEMINI_AUTO_FALLBACK: 'maybe' }).code).toBe(400);
   });
 

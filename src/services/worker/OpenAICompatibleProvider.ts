@@ -77,8 +77,13 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
   /** Throw a provider-specific "API key not configured" error. */
   protected abstract missingApiKeyError(): Error;
 
-  /** Issue the actual HTTP request and normalize its response. */
-  protected abstract query(history: ConversationMessage[], config: TConfig, signal?: AbortSignal): Promise<ProviderQueryResult>;
+  /**
+   * Issue the actual HTTP request and normalize its response.
+   * `noRetry` is for deadline-bound side requests (field compression): a retry
+   * would only burn the remaining budget. Session queries pass a cancel signal
+   * but keep transient-failure retries.
+   */
+  protected abstract query(history: ConversationMessage[], config: TConfig, signal?: AbortSignal, noRetry?: boolean): Promise<ProviderQueryResult>;
 
   /**
    * One bounded, standalone call that condenses an oversized tool payload.
@@ -92,6 +97,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       [{ role: 'user', content: buildFieldCompressionPrompt(text, budgetChars) }],
       config,
       signal,
+      true,
     );
     return result.content || null;
   }

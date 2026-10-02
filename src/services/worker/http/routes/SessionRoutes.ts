@@ -415,9 +415,10 @@ export class SessionRoutes extends BaseRouteHandler {
           });
         }
 
-        // Preserve transport errors only for retryable kinds; unrecoverable errors
-        // (model_incompatible, unknown_bad_request, etc.) should finalize immediately
-        const isTransient = isClassified(error) && (
+        // Drop the batch only when the provider classified the failure as
+        // non-retryable (model_incompatible, unknown_bad_request, ...). Unclassified
+        // errors (network, SDK crash) keep the batch: losing work is worse than a retry.
+        const isUnrecoverable = isClassified(error) && !(
           error.kind === 'transient' ||
           error.kind === 'rate_limit' ||
           error.kind === 'quota_exhausted' ||
@@ -427,9 +428,9 @@ export class SessionRoutes extends BaseRouteHandler {
           ? 'auth:provider_failure'
           : isClassified(error) && error.kind === 'quota_exhausted'
             ? 'quota:provider_failure'
-            : isTransient
-              ? 'transport:provider_failure'
-              : null;
+            : isUnrecoverable
+              ? null
+              : 'transport:provider_failure';
 
         if (isClassified(error)) {
           logger.error('SESSION', 'Observer failed', {

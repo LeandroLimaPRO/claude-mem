@@ -296,14 +296,14 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     return contents;
   }
 
-  protected async query(history: ConversationMessage[], config: GeminiConfig, signal?: AbortSignal): Promise<ProviderQueryResult> {
+  protected async query(history: ConversationMessage[], config: GeminiConfig, signal?: AbortSignal, noRetry?: boolean): Promise<ProviderQueryResult> {
     const latest = this.getGeminiConfig();
     return this.executeWithDynamicCascade(history, {
       ...config,
       model: config.model === (config.configuredModel ?? config.model) ? latest.model : config.model,
       rateLimitingEnabled: latest.rateLimitingEnabled,
       autoFallback: latest.autoFallback,
-    }, signal);
+    }, signal, noRetry);
   }
 
   private fetchGenerateContent(
@@ -368,7 +368,8 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
   private async executeWithDynamicCascade(
     history: ConversationMessage[],
     config: GeminiConfig,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    noRetry = false,
   ): Promise<ProviderQueryResult> {
     const totalChars = history.reduce((sum, m) => sum + m.content.length, 0);
     const estimatedTokens = Math.max(100, Math.ceil(totalChars / 4));
@@ -495,6 +496,7 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
         }, {
           label: `Gemini ${targetModelId}`,
           abortSignal: signal,
+          ...(noRetry ? { maxRetries: 0 } : {}),
           beforeAttempt: config.rateLimitingEnabled ? async waitSignal => {
             const admission = await this.waitForReservation(currentModelId, estimatedTokens, waitSignal);
             targetModelId = admission.modelId;
