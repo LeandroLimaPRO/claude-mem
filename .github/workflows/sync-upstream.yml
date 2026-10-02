@@ -1,0 +1,102 @@
+name: Sync upstream
+
+# Fork-only: merges thedotmack/claude-mem main into this fork daily.
+# Clean merge + green build/tests -> pushed to main (installed plugins pick it up
+# via marketplace auto-update). Conflicts or failures -> issue, main untouched.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'thedotmack/claude-mem'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ISSUE_TITLE: 'Sync upstream: needs manual merge'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream https://github.com/thedotmack/claude-mem.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge
+        id: merge
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-edit upstream/main; then exit 0; fi
+          # Generated bundles are rebuilt below, so their conflicts don't matter.
+          git diff --name-only --diff-filter=U | grep -E '^plugin/(scripts|ui)/' \
+            | xargs -r sh -c 'git checkout --theirs -- "$@" && git add -- "$@"' _
+          left=$(git diff --name-only --diff-filter=U)
+          if [ -n "$left" ]; then
+            printf '%s\n' "$left" > conflicts.txt
+            git merge --abort
+            echo "reason=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git commit --no-edit
+
+      - uses: actions/setup-node@v4
+        if: steps.fetch.outputs.skip != 'true'
+        with:
+          node-version: '20'
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.fetch.outputs.skip != 'true'
+        with:
+          bun-version: latest
+
+      - name: Build and test
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          bun test tests
+
+      - name: Commit rebuilt bundles and push
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          git add -A plugin
+          git diff --cached --quiet || git commit -m "build: regenerate plugin bundles after upstream sync"
+          git push origin HEAD:main
+
+      - name: Report failure
+        if: failure()
+        run: |
+          if [ -f conflicts.txt ]; then
+            body="Upstream merge has conflicts outside generated bundles:"$'\n\n'"$(sed 's/^/- `/; s/$/`/' conflicts.txt)"
+          else
+            body="Upstream merge was clean but build/tests failed."
+          fi
+          body="$body"$'\n\n'"Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$'\n\n'"Resolve locally: \`git fetch upstream && git merge upstream/main\`, rebuild, push."
+          n=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body "$body"
+          fi
