@@ -54,6 +54,20 @@ function getMarketplaceExcludes(rootDir) {
   return [...BASE_EXCLUDES, ...getGitignoreExcludes(rootDir)];
 }
 
+function mirrorMarketplace(rootDir, installedPath) {
+  const exclude = getMarketplaceExcludes(rootDir);
+  const stats = mirrorDirectory(rootDir, installedPath, { exclude });
+  // These release bundles are generated under ignored directories. Sync only
+  // their explicit subtrees, keeping the rest of dist and ignored data excluded.
+  for (const relativePath of ['dist/pi-extension', 'dsh/lib']) {
+    const source = path.join(rootDir, relativePath);
+    if (!existsSync(source)) continue;
+    const bundle = mirrorDirectory(source, path.join(installedPath, relativePath), { exclude });
+    for (const key of ['copied', 'metadata', 'deleted']) stats[key] += bundle[key];
+  }
+  return stats;
+}
+
 function getPluginVersion() {
   try {
     const pluginJsonPath = path.join(__dirname, '..', 'plugin', '.claude-plugin', 'plugin.json');
@@ -89,9 +103,7 @@ function main() {
     const bunCmd = existsSync(homeBun) ? `"${homeBun}"` : 'bun';
 
     if (path.resolve(rootDir).toLowerCase() !== path.resolve(INSTALLED_PATH).toLowerCase()) {
-      const marketplace = mirrorDirectory(rootDir, INSTALLED_PATH, {
-        exclude: getMarketplaceExcludes(rootDir)
-      });
+      const marketplace = mirrorMarketplace(rootDir, INSTALLED_PATH);
       console.log(`Marketplace: ${marketplace.copied} copied, ${marketplace.metadata} metadata reconciled, ${marketplace.deleted} stale removed`);
 
       console.log('Running bun install in marketplace...');
@@ -124,4 +136,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { getGitignoreExcludes, getMarketplaceExcludes, INSTALLED_PATH, CACHE_BASE_PATH };
+module.exports = { getGitignoreExcludes, getMarketplaceExcludes, mirrorMarketplace, INSTALLED_PATH, CACHE_BASE_PATH };

@@ -181,6 +181,20 @@ describe('scrubProperties', () => {
     expect(result.abort_reason).toBe('restart_guard');
   });
 
+  it('keeps the deadline-abort reason and its rollup counter', () => {
+    const result = scrubProperties({
+      abort_reason: 'deadline_exceeded',
+      outcomes_aborted: 4,
+      outcomes_aborted_deadline_exceeded: 3,
+    });
+
+    expect(result).toEqual({
+      abort_reason: 'deadline_exceeded',
+      outcomes_aborted: 4,
+      outcomes_aborted_deadline_exceeded: 3,
+    });
+  });
+
   it('keeps the worker lifecycle keys with primitive values', () => {
     const result = scrubProperties({
       previous_shutdown: 'crash',
@@ -206,6 +220,7 @@ describe('scrubProperties', () => {
       error_mode: 'worker_unavailable',
       consecutive_failures: 3,
       threshold_tripped: true,
+      pre_latch_state: false,
     });
 
     expect(result).toEqual({
@@ -213,6 +228,7 @@ describe('scrubProperties', () => {
       error_mode: 'worker_unavailable',
       consecutive_failures: 3,
       threshold_tripped: true,
+      pre_latch_state: false,
     });
   });
 

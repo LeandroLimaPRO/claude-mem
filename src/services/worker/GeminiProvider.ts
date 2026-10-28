@@ -2,12 +2,25 @@ import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { describeNetworkFailure, isConnectionRefused } from '../../shared/network-failure.js';
 import { getCredential } from '../../shared/EnvManager.js';
 import { paths } from '../../shared/paths.js';
 import { estimateTokens } from '../../shared/timeline-formatting.js';
 import type { ActiveSession, ConversationMessage } from '../worker-types.js';
-import { ClassifiedProviderError } from './provider-errors.js';
+import { randomUUID } from 'crypto';
+import { ClassifiedProviderError, rateLimitUntilNextKey, readCappedErrorBody } from './provider-errors.js';
+import type { PaidSendBudget } from './paid-send-budget.js';
+import { buildKeyPool, resolvePoolKeys, retryPolicyForPool, withKeyPool } from '../../shared/api-key-pool.js';
+import { keysForEndpoint } from '../../shared/cmem-gateway.js';
 import { withRetry, parseRetryAfterMs } from './retry.js';
+import {
+  GEMINI_REGION_REFUSAL_ACTION,
+  GEMINI_REGION_REFUSAL_CODE,
+  geminiRegionRefusalMessage,
+  isGeminiRegionRefusal,
+  parseGeminiErrorDetails,
+} from '../../shared/gemini-error-details.js';
+import { readGeminiAnswerText, type GeminiPart } from '../../shared/gemini-answer-text.js';
 import { OpenAICompatibleProvider, type ProviderQueryResult } from './OpenAICompatibleProvider.js';
 import { RateLimitTracker } from './gemini/RateLimitTracker.js';
 import { DynamicModelRegistry } from './gemini/DynamicModelRegistry.js';
@@ -15,6 +28,14 @@ import { GeminiStatusBroadcaster } from './gemini/GeminiStatusBroadcaster.js';
 import { DEFAULT_MODEL_CASCADE } from './gemini/model-cascade.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { TokenReservation } from './gemini/types.js';
+import { resolveContextWindowTokens, resolveObserverMaxOutputTokens } from './context-window.js';
+import {
+  claimReasoningBudgetRetry,
+  combineBilledGeminiUsage,
+  isLengthTruncatedEmptyReply,
+  reasoningBudgetSkippedMessage,
+  startReasoningRetryDeadline,
+} from './reasoning-budget.js';
 
 // v1beta is required: the current Gemini 3.x models, Gemma models, and the Google-maintained
 // `-latest` aliases are exposed under v1beta.
@@ -37,12 +58,37 @@ export function classifyGeminiError(input: {
   const body = input.bodyText ?? '';
   const lower = body.toLowerCase();
   const headers = input.headers;
-  const retryAfterMs = headers ? parseRetryAfterMs(headers.get('retry-after')) : undefined;
   const cause = status === undefined
     ? input.cause
     : new Error(`Gemini HTTP error (status ${status}${input.requestId ? `, request ${input.requestId}` : ''})`);
 
-  // Distinguish daily/total quota from minute-level rate limits
+  // A 429 is decided BEFORE the body markers below, because every Gemini 429
+  // body carries `RESOURCE_EXHAUSTED` no matter what it is actually refusing.
+  // Testing the marker first made this branch unreachable, so this provider
+  // never produced `kind: 'rate_limit'` and never populated `retryAfterMs` —
+  // the two things `withRetry` and the quota breaker key on.
+  const details = parseGeminiErrorDetails(body);
+  const retryAfterMs = (headers ? parseRetryAfterMs(headers.get('retry-after')) : undefined)
+    ?? details.retryDelayMs;
+
+  if (status === 429) {
+    if (details.periodQuotaExhausted) {
+      // A whole day/week/month is spent: the breaker's long cooldown is the
+      // right answer. Carry the hint anyway — it is the reset time.
+      return new ClassifiedProviderError(
+        `Gemini quota exhausted (status ${status})`,
+        { kind: 'quota_exhausted', cause, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+      );
+    }
+    // A window that clears on its own. Holding this for the quota cooldown
+    // turns a six-second throttle into a half-hour outage.
+    return new ClassifiedProviderError(
+      'Gemini rate limit (429)',
+      { kind: 'rate_limit', cause, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+    );
+  }
+
+  // Quota exceeded — by body marker — even on 500 (Gemini quirk).
   if (lower.includes('quota exceeded') || lower.includes('resource_exhausted')) {
     const minuteQuota = /per[ _]?minute|\brpm\b|\btpm\b/.test(lower);
     if (lower.includes('per day') || lower.includes('daily') || lower.includes('rpd') ||
@@ -58,10 +104,13 @@ export function classifyGeminiError(input: {
     );
   }
 
-  if (status === 429) {
+  // Outside the regions Google serves (gemini-error-details.ts): pause the way
+  // a refused key does (buffered work kept, one cooldown) and say what to
+  // change. The key pool never rotates on this code.
+  if (status !== undefined && isGeminiRegionRefusal(status, body)) {
     return new ClassifiedProviderError(
-      'Gemini rate limit (429)',
-      { kind: 'rate_limit', cause, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+      geminiRegionRefusalMessage(status),
+      { kind: 'auth_invalid', cause, code: GEMINI_REGION_REFUSAL_CODE, action: GEMINI_REGION_REFUSAL_ACTION },
     );
   }
 
@@ -99,10 +148,18 @@ export function classifyGeminiError(input: {
 
   if (status === 400) {
     const category = categorizeGeminiBadRequest(body);
+    if (category === 'api_key') {
+      // Google also reports invalid credentials as HTTP 400. The key pool
+      // must retire this key and try its next credential, as for 401/403.
+      return new ClassifiedProviderError(
+        'Gemini auth invalid (status 400)',
+        { kind: 'auth_invalid', cause },
+      );
+    }
     const kind = category === 'model_unsupported'
       ? 'model_unsupported'
       : category === 'context_limit'
-      ? 'context_limit'
+      ? 'context_overflow'
       : 'unrecoverable';
     return new ClassifiedProviderError(
       `Gemini bad request: ${category}`,
@@ -125,9 +182,16 @@ export function classifyGeminiError(input: {
   }
 
   if (status === undefined) {
+    const network = describeNetworkFailure(input.cause);
     return new ClassifiedProviderError(
       `Gemini network error: ${input.cause instanceof Error ? input.cause.message : String(input.cause)}`,
-      { kind: 'transient', cause: input.cause },
+      {
+        kind: 'transient',
+        cause: input.cause,
+        // A refused connection never sent the request, so it is pre-send and
+        // must not spend the paid-send budget (#4604).
+        ...(isConnectionRefused(network) ? { paidSendOutcome: 'refused_before_work' as const } : {}),
+      },
     );
   }
 
@@ -137,6 +201,24 @@ export function classifyGeminiError(input: {
   );
 }
 
+// Only models currently served to new API keys. The 2.x / 2.0 IDs were removed
+// because Google 404s them for freshly created keys, and bare `gemini-3-flash`
+// (no `-preview`) is not a real ID. `*-latest` are Google-maintained aliases
+// that track the current GA release, so they never go stale on new keys.
+export type GeminiModel =
+  | 'gemini-flash-latest'
+  | 'gemini-flash-lite-latest'
+  | 'gemini-3.5-flash'
+  | 'gemini-3.1-flash-lite'
+  | 'gemini-3-flash-preview';
+
+export const GEMINI_RPM_LIMITS: Record<GeminiModel, number> = {
+  'gemini-flash-latest': 10,
+  'gemini-flash-lite-latest': 15,
+  'gemini-3.5-flash': 10,
+  'gemini-3.1-flash-lite': 15,
+  'gemini-3-flash-preview': 5,
+};
 const GEMINI_EMPTY_HISTORY_FALLBACK = 'Continue the memory observation request.';
 
 export type GeminiBadRequestCategory =
@@ -194,17 +276,20 @@ export function categorizeGeminiBadRequest(bodyText: string): GeminiBadRequestCa
   return 'unknown_bad_request';
 }
 
+
 interface GeminiResponse {
+  modelVersion?: string;
   candidates?: Array<{
     content?: {
-      parts?: Array<{
-        text?: string;
-      }>;
+      parts?: GeminiPart[];
     };
+    /** 'STOP', 'MAX_TOKENS', 'SAFETY', … */
+    finishReason?: string;
   }>;
   usageMetadata?: {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
     totalTokenCount?: number;
   };
 }
@@ -216,6 +301,7 @@ interface GeminiContent {
 
 export interface GeminiConfig {
   apiKey: string;
+  apiKeys?: string[];
   model: string;
   configuredModel?: string;
   rateLimitingEnabled: boolean;
@@ -241,6 +327,10 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
 
   protected missingApiKeyError(): Error {
     return new Error('Gemini API key not configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
+  }
+
+  protected resolveContextWindow(config: GeminiConfig): Promise<number> {
+    return resolveContextWindowTokens('gemini', config.model);
   }
 
   protected estimateTokens(text: string): number {
@@ -296,33 +386,49 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     return contents;
   }
 
-  protected async query(history: ConversationMessage[], config: GeminiConfig, signal?: AbortSignal, noRetry?: boolean): Promise<ProviderQueryResult> {
+  protected async query(
+    history: ConversationMessage[],
+    config: GeminiConfig,
+    signal?: AbortSignal,
+    perAttemptTimeoutMs?: number,
+    paidSendBudget?: PaidSendBudget,
+  ): Promise<ProviderQueryResult> {
     const latest = this.getGeminiConfig();
     return this.executeWithDynamicCascade(history, {
       ...config,
       model: config.model === (config.configuredModel ?? config.model) ? latest.model : config.model,
       rateLimitingEnabled: latest.rateLimitingEnabled,
       autoFallback: latest.autoFallback,
-    }, signal, noRetry);
+    }, signal, false);
   }
 
   private fetchGenerateContent(
     url: string,
     contents: GeminiContent[],
-    priorRequestId: string | null,
-    attemptSignal: AbortSignal
+    systemInstruction: string | null = null,
+    maxOutputTokens: number = 4096,
+    clientAttemptId: string = randomUUID(),
+    attemptSignal: AbortSignal = new AbortController().signal,
+    disableThinking: boolean = false,
   ): Promise<Response> {
     return fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(priorRequestId ? { 'x-claude-mem-prior-request-id': priorRequestId } : {}),
+        // Tracing only; never treated as server-side idempotency.
+        'x-client-request-id': clientAttemptId,
       },
       body: JSON.stringify({
+        // The observer's instructions and schema, anchored (#3868).
+        ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
         contents,
         generationConfig: {
           temperature: 0.3,
-          maxOutputTokens: 4096,
+          maxOutputTokens: maxOutputTokens || 4096,
+          // Only on the one-shot retry. Sending thinkingBudget 0 up front is
+          // rejected by models whose thinking is mandatory (Gemini 2.5 Pro,
+          // Gemini 3.5 Flash).
+          ...(disableThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         },
       }),
       signal: attemptSignal,
@@ -371,9 +477,11 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
     signal?: AbortSignal,
     noRetry = false,
   ): Promise<ProviderQueryResult> {
+    const { system, turns } = this.anchorFraming(history);
+    const contents = this.conversationToGeminiContents(turns);
     const totalChars = history.reduce((sum, m) => sum + m.content.length, 0);
     const estimatedTokens = Math.max(100, Math.ceil(totalChars / 4));
-    const contents = this.conversationToGeminiContents(history);
+    const maxOutputTokens = resolveObserverMaxOutputTokens();
 
     const attemptedModels = new Set<string>();
     let currentModelId = config.model;
@@ -408,7 +516,7 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
             const url = `${GEMINI_API_URL}/${encodeURIComponent(targetModelId)}:generateContent?key=${config.apiKey}`;
             attemptSignal.throwIfAborted();
             sent = true;
-            response = await this.fetchGenerateContent(url, contents, priorRequestId, attemptSignal);
+            response = await this.fetchGenerateContent(url, contents, system, maxOutputTokens, priorRequestId ?? randomUUID(), attemptSignal);
           } catch (networkError: unknown) {
             if (networkError instanceof ClassifiedProviderError) throw networkError;
             if (attemptSignal.aborted) throw networkError;
@@ -506,7 +614,7 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
 
         const finishReason = (data as any)?.candidates?.[0]?.finishReason;
         const promptFeedback = (data as any)?.promptFeedback;
-        const textContent = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+        const textContent = readGeminiAnswerText(data.candidates?.[0]?.content?.parts);
         const isSafetyBlocked = (finishReason === 'SAFETY' || promptFeedback?.blockReason === 'SAFETY') && !textContent;
 
         if (config.autoFallback && isSafetyBlocked) {
@@ -574,14 +682,14 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
         throw lastErr;
       }
     }
-
   }
 
   private getGeminiConfig(): GeminiConfig {
     const settingsPath = paths.settings();
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-    const apiKey = settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
+    const apiKeys = resolveGeminiKeys(settings);
+    const apiKey = apiKeys[0] || settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
     const defaultModel = 'auto';
     const configuredModel = settings.CLAUDE_MEM_GEMINI_MODEL || defaultModel;
 
@@ -600,14 +708,28 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
 
     this.tracker.setAutoFallback(autoFallback);
 
-    return { apiKey, model: configuredModel, configuredModel, rateLimitingEnabled, autoFallback };
+    return { apiKey, apiKeys, model: configuredModel, configuredModel, rateLimitingEnabled, autoFallback };
   }
 }
 
+/**
+ * The Gemini keys that may be sent: the primary first, then the rotation list,
+ * through the shared cmem key lock. Google is never the cmem gateway, so a
+ * cm_pro_ key pasted into either setting is dropped rather than sent as ?key=.
+ */
+function resolveGeminiKeys(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): string[] {
+  const primaryKey = settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
+  return keysForEndpoint(GEMINI_API_URL, buildKeyPool(
+    primaryKey,
+    settings.CLAUDE_MEM_GEMINI_API_KEYS || getCredential('GEMINI_API_KEYS') || '',
+  ));
+}
+
 export function isGeminiAvailable(): boolean {
-  const settingsPath = paths.settings();
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return !!(settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY'));
+  const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
+  // A pool-only install (no CLAUDE_MEM_GEMINI_API_KEY, keys supplied as a list)
+  // is still available — dispatch must not silently fall through to Claude.
+  return resolveGeminiKeys(settings).length > 0;
 }
 
 export function isGeminiSelected(): boolean {

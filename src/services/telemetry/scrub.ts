@@ -101,7 +101,7 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   'days_since_last_obs',
   // search_performed retrieval quality — result_count is an integer,
   // chroma_available a boolean, fallback_reason one of OUR enum values
-  // (none | chroma_connection | chroma_error | chroma_not_initialized).
+  // (none | chroma_connection | chroma_error | chroma_not_initialized | chroma_zero_results).
   // Never the query, never an error message.
   'result_count',
   'chroma_available',
@@ -109,15 +109,16 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   // session_compressed trust signals — booleans, counters, and our own
   // closed enums (invalid_output_class: xml | idle | prose, where 'xml' means
   // XML-shaped output that still failed to parse; abort_reason:
-  // idle | shutdown | overflow | restart_guard | quota | provider_switch | none).
+  // idle | shutdown | overflow | restart_guard | quota | rate_limit | auth |
+  // provider_switch | deadline_exceeded | output_retry | drift | none).
   // Never model output, never raw abort strings.
   'invalid_output_class',
   'consecutive_invalid_outputs',
   'respawn_triggered',
   'abort_reason',
   // Worker lifecycle health — previous_shutdown (crash | clean | unknown),
-  // shutdown_reason (stop | restart | signal), uptime in whole seconds, and
-  // process memory as integer megabytes. No paths, no PIDs.
+  // shutdown_reason (stop | restart | signal | idle), uptime in whole
+  // seconds, and process memory as integer megabytes. No paths, no PIDs.
   'previous_shutdown',
   'previous_uptime_seconds',
   'uptime_seconds',
@@ -127,16 +128,18 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   // hook_failed distress signal — hook_type is one of OUR hook names
   // (context | session-init | observation | summarize | session-end | file-context),
   // error_mode (worker_unavailable | blocking_error), plus a consecutive
-  // failure counter and threshold flag. Never an error message.
+  // failure counter, threshold flag, and a pre-latch-state flag. Never an
+  // error message.
   'hook_type',
   'error_mode',
   'consecutive_failures',
   'threshold_tripped',
+  'pre_latch_state',
   // usage_limit_hit — the SDK's rate_limit_info projected to closed enums:
   // limit_window (five_hour | seven_day | seven_day_opus | seven_day_sonnet |
-  // overage | unknown), overage_status (allowed | allowed_warning | rejected |
-  // unknown), a boolean, and whole minutes until the window resets. Never the
-  // provider's limit message text.
+  // seven_day_overage_included | overage | unknown), overage_status (allowed |
+  // allowed_warning | rejected | unknown), a boolean, and whole minutes until
+  // the window resets. Never the provider's limit message text.
   'limit_window',
   'overage_status',
   'is_using_overage',
@@ -176,8 +179,14 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   'outcomes_ok',
   'outcomes_error',
   'outcomes_aborted',
+  // Integer subset of outcomes_aborted: turns abandoned at the LLM deadline.
+  'outcomes_aborted_deadline_exceeded',
   'outcomes_invalid_output',
   'top_model',
+  // top_abort_reason: the dominant normalized abort_reason among the session's
+  // aborted turns (same closed enum as abort_reason above). Present only when a
+  // turn aborted; never a raw abort string.
+  'top_abort_reason',
   // Observed-session identity (NOT the observer): the model id the user's IDE
   // session ran (from its transcript) and a closed-enum billing posture
   // (max | pro | team | enterprise | subscription | api_key | bedrock | vertex | foundry | unknown).
@@ -211,6 +220,21 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   'observations_created',
   'total_observations_injected',
   'total_tokens_saved_vs_naive',
+  // Work-state usage: closed dimensions and counts; no task/session/agent IDs.
+  'platform', 'agent_role', 'instruction_state',
+  'instruction_returned_count', 'instruction_disabled_count',
+  'instruction_excluded_count', 'instruction_missing_count', 'instruction_unknown_count',
+  'captured_prompt_count', 'captured_session_count', 'captured_tool_count',
+  'unidentified_tool_event_count', 'native_todo_count',
+  ...['captured', 'mcp'].flatMap(source => ['read', 'write'].flatMap(operation => [
+    `${source}_${operation}_count`,
+    ...['ok', 'error', 'excluded', 'disabled', 'unknown'].map(outcome => `${source}_${operation}_${outcome}_count`),
+  ])),
+  // work_view_opened / work_view_switched — which My Work viewer page is on
+  // screen, as the viewer's own closed page ids (setup | work | rules | suggested | past-focus).
+  // Never a request title, prompt, observation, file path, or search text.
+  'view',
+  'previous_view',
 ]);
 
 const MAX_STRING_LENGTH = 200;

@@ -128,6 +128,19 @@ describe('Issue #2375: ANTHROPIC_BASE_URL env-var isolation', () => {
     expect(result.ANTHROPIC_AUTH_TOKEN).toBe('test-token');
   });
 
+  it('reads the first key of a BOM-prefixed .env (Notepad / PowerShell "UTF-8")', () => {
+    fs.writeFileSync(
+      TEST_ENV_FILE,
+      '\uFEFFANTHROPIC_BASE_URL=https://gateway.example\nANTHROPIC_AUTH_TOKEN=test-token\n',
+      { mode: 0o600 },
+    );
+
+    const result = buildIsolatedEnv();
+
+    expect(result.ANTHROPIC_BASE_URL).toBe('https://gateway.example');
+    expect(result.ANTHROPIC_AUTH_TOKEN).toBe('test-token');
+  });
+
   it('leaked process.env BASE_URL never reaches the OAuth-skip predicate', async () => {
     // The root cause of #2375: a BASE_URL exported by the parent shell used to
     // survive into isolatedEnv and trigger the OAuth-skip path, leaving the
@@ -179,6 +192,140 @@ describe('Issue #2375: ANTHROPIC_BASE_URL env-var isolation', () => {
     } finally {
       oauthSpy.mockRestore();
     }
+  });
+
+  describe('standIn (the quota-fallback credential)', () => {
+    const presentToken: oauthToken.OAuthTokenResult = { kind: 'present', token: 'oauth-token', source: 'keychain' };
+
+    it("'subscription' drops the .env key and injects the login token", async () => {
+      fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-spent\n', { mode: 0o600 });
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'subscription' });
+        expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe('oauth-token');
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it("'subscription' keeps the .env key when no login token is available", async () => {
+      fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-spent\n', { mode: 0o600 });
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken')
+        .mockResolvedValue({ kind: 'absent', reason: 'no login' });
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'subscription' });
+        expect(result.ANTHROPIC_API_KEY).toBe('sk-ant-spent');
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it("'subscription' leaves an expired stored login for the CLI to refresh", async () => {
+      const profile = fs.mkdtempSync(join(TEST_DATA_DIR, 'expired-login-'));
+      const previousProfile = process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR = profile;
+      fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-spent\nANTHROPIC_AUTH_TOKEN=spent-token\n');
+      fs.writeFileSync(join(profile, '.credentials.json'), JSON.stringify({
+        claudeAiOauth: { accessToken: 'expired-access', refreshToken: 'refresh-token', expiresAt: Date.now() - 3_600_000 },
+      }));
+      const expired = oauthToken.readClaudeCredentialsFile(profile);
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(expired);
+      try {
+        expect(expired.kind).toBe('expired');
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'subscription' });
+        expect(result.CLAUDE_CONFIG_DIR).toBe(profile);
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+        expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(result.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+      } finally {
+        oauthSpy.mockRestore();
+        if (previousProfile === undefined) delete process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_MEM_CLAUDE_CONFIG_DIR = previousProfile;
+        fs.rmSync(profile, { recursive: true, force: true });
+      }
+    });
+
+    it('is ignored under a gateway ANTHROPIC_BASE_URL', async () => {
+      fs.writeFileSync(
+        TEST_ENV_FILE,
+        'ANTHROPIC_BASE_URL=https://gateway.example\nANTHROPIC_API_KEY=sk-gateway\n',
+        { mode: 0o600 },
+      );
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'subscription' });
+        expect(result.ANTHROPIC_API_KEY).toBe('sk-gateway');
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it('leaves the key alone, and never passes the fallback key, without standIn', async () => {
+      fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-live\nANTHROPIC_FALLBACK_API_KEY=sk-ant-fallback\n', { mode: 0o600 });
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth();
+        expect(result.ANTHROPIC_API_KEY).toBe('sk-ant-live');
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+        expect(result.ANTHROPIC_FALLBACK_API_KEY).toBeUndefined();
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it('never passes a shell-exported fallback key to the CLI without standIn', async () => {
+      const previous = process.env.ANTHROPIC_FALLBACK_API_KEY;
+      process.env.ANTHROPIC_FALLBACK_API_KEY = 'sk-ant-shell-fallback';
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth();
+        expect(result.ANTHROPIC_FALLBACK_API_KEY).toBeUndefined();
+        expect(result.ANTHROPIC_API_KEY).not.toBe('sk-ant-shell-fallback');
+      } finally {
+        oauthSpy.mockRestore();
+        if (previous === undefined) delete process.env.ANTHROPIC_FALLBACK_API_KEY;
+        else process.env.ANTHROPIC_FALLBACK_API_KEY = previous;
+      }
+    });
+
+    it("'api-key' runs a login primary on the fallback key, without reading the login", async () => {
+      fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_FALLBACK_API_KEY=sk-ant-fallback\n', { mode: 0o600 });
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'api-key' });
+        expect(result.ANTHROPIC_API_KEY).toBe('sk-ant-fallback');
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+        expect(result.ANTHROPIC_FALLBACK_API_KEY).toBeUndefined();
+        expect(oauthSpy).not.toHaveBeenCalled();
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it("'api-key' keeps the login when no fallback key is set", async () => {
+      const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(presentToken);
+      try {
+        const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'api-key' });
+        expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe('oauth-token');
+      } finally {
+        oauthSpy.mockRestore();
+      }
+    });
+
+    it("'api-key' is ignored under a gateway ANTHROPIC_BASE_URL", async () => {
+      fs.writeFileSync(
+        TEST_ENV_FILE,
+        'ANTHROPIC_BASE_URL=https://gateway.example\nANTHROPIC_AUTH_TOKEN=gw-token\nANTHROPIC_FALLBACK_API_KEY=sk-ant-fallback\n',
+        { mode: 0o600 },
+      );
+      const result = await buildIsolatedEnvWithFreshOAuth(true, { standIn: 'api-key' });
+      expect(result.ANTHROPIC_AUTH_TOKEN).toBe('gw-token');
+      expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+    });
   });
 });
 
@@ -288,12 +435,84 @@ describe('#2753: buildIsolatedEnv resolves CLAUDE_CONFIG_DIR for the SDK subproc
     expect(result.CLAUDE_CONFIG_DIR).not.toBe(CLAUDE_CONFIG_DIR);
   });
 
-  it('falls through to the frozen CLAUDE_CONFIG_DIR (env-or-default, resolved at module load) when the setting is empty', () => {
+  function withProcessEnvConfigDir(value: string | undefined, run: () => void): void {
+    const originalProcessEnvConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    if (value === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = value;
+    }
+    try {
+      run();
+    } finally {
+      if (originalProcessEnvConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = originalProcessEnvConfigDir;
+      }
+    }
+  }
+
+  it('#4149: with the setting empty and nothing exported, the SDK subprocess gets NO CLAUDE_CONFIG_DIR', () => {
     stubConfigDirSetting('');
+
+    withProcessEnvConfigDir(undefined, () => {
+      // Default profile: the variable must be ABSENT so Claude Code reads the
+      // bare 'Claude Code-credentials' keychain entry the worker injects under.
+      expect(buildIsolatedEnv().CLAUDE_CONFIG_DIR).toBeUndefined();
+    });
+  });
+
+  // #4149 — Claude Code keys the keychain name on whether CLAUDE_CONFIG_DIR is
+  // SET. A user who explicitly exports CLAUDE_CONFIG_DIR=~/.claude logged in
+  // under the SUFFIXED entry, so their child must keep the variable (and the
+  // worker must read the suffixed entry — see oauth-token.test.ts).
+  it('#4149: with the setting empty, an explicit CLAUDE_CONFIG_DIR export of the default dir is still stamped', () => {
+    stubConfigDirSetting('');
+
+    withProcessEnvConfigDir(DEFAULT_CLAUDE_CONFIG_DIR, () => {
+      const result = buildIsolatedEnv();
+
+      expect(result.CLAUDE_CONFIG_DIR).toBeDefined();
+      expect(result.CLAUDE_CONFIG_DIR).toBe(oauthToken.resolveEffectiveClaudeConfigDir(''));
+    });
+  });
+
+  it('#4149: an empty CLAUDE_CONFIG_DIR export counts as unset, as it does for Claude Code', () => {
+    stubConfigDirSetting('');
+
+    withProcessEnvConfigDir('', () => {
+      expect(buildIsolatedEnv().CLAUDE_CONFIG_DIR).toBeUndefined();
+    });
+  });
+
+  // #4149 — regression: a default-profile config dir (the resolved '~/.claude',
+  // whether typed as '~/.claude' or already expanded) must leave
+  // CLAUDE_CONFIG_DIR ABSENT on the SDK subprocess. Claude Code derives its
+  // macOS keychain service name from whether CLAUDE_CONFIG_DIR is SET, so any
+  // value here — even the default — sent the child to a suffixed
+  // 'Claude Code-credentials-<hash>' entry a normal login never creates, while
+  // the worker injects under the bare name (deriveMacKeychainServiceName). Once
+  // the access token expired the worker stopped injecting and capture silently
+  // stopped for default-profile macOS users.
+  it('#4149: stamps NO CLAUDE_CONFIG_DIR on the SDK subprocess for a default-profile setting', () => {
+    stubConfigDirSetting('~/.claude');
 
     const result = buildIsolatedEnv();
 
-    expect(result.CLAUDE_CONFIG_DIR).toBe(CLAUDE_CONFIG_DIR);
+    expect(result.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
+  it('#4149: a default-dir SETTING deletes a blanket-copied process.env.CLAUDE_CONFIG_DIR', () => {
+    // The setting names the profile: `~/.claude` in settings means "my normal
+    // profile", so even when the worker inherited CLAUDE_CONFIG_DIR in its own
+    // env (and the blanket process.env copy carries it), the child ends up
+    // with the variable UNSET.
+    stubConfigDirSetting(DEFAULT_CLAUDE_CONFIG_DIR);
+
+    withProcessEnvConfigDir(DEFAULT_CLAUDE_CONFIG_DIR, () => {
+      expect(buildIsolatedEnv().CLAUDE_CONFIG_DIR).toBeUndefined();
+    });
   });
 
   it('never touches the worker\'s own paths.CLAUDE_CONFIG_DIR / MARKETPLACE_ROOT module constants, nor the real process.env.CLAUDE_CONFIG_DIR', () => {

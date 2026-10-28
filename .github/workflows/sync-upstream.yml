@@ -87,6 +87,7 @@ jobs:
 
       - name: Report failure
         if: failure()
+        continue-on-error: true
         run: |
           if [ -f conflicts.txt ]; then
             body="Upstream merge has conflicts outside generated bundles:"$'\n\n'"$(sed 's/^/- `/; s/$/`/' conflicts.txt)"
@@ -94,9 +95,9 @@ jobs:
             body="Upstream merge was clean but build/tests failed."
           fi
           body="$body"$'\n\n'"Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"$'\n\n'"Resolve locally: \`git fetch upstream && git merge upstream/main\`, rebuild, push."
-          n=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[0].number')
+          n=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[0].number' 2>/dev/null || true)
           if [ -n "$n" ]; then
-            gh issue comment "$n" --body "$body"
+            gh issue comment "$n" --body "$body" || echo "Warning: Failed to comment on issue (permissions?)"
           else
-            gh issue create --title "$ISSUE_TITLE" --body "$body"
+            gh issue create --title "$ISSUE_TITLE" --body "$body" || echo "Warning: Failed to create issue (permissions?)"
           fi

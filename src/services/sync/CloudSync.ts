@@ -41,11 +41,10 @@
 // before acknowledgment state changes and enters the normal backoff path.
 
 import type { Database } from 'bun:sqlite';
-import { existsSync, readFileSync } from 'fs';
 import { hostname } from 'os';
 import { randomUUID } from 'crypto';
 import { logger } from '../../utils/logger.js';
-import { parseJsonWithBom, writeJsonFileAtomic } from '../../shared/atomic-json.js';
+import { updateSettingsDocument } from '../../shared/settings-document.js';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import {
@@ -59,6 +58,7 @@ import {
   type CanonicalWireOp,
   type ContentKind,
 } from './CanonicalContent.js';
+import { PROMPT_TEXT_COLUMNS_SQL, clampPromptTextForSync } from './prompt-text-clamp.js';
 import {
   classifySyncAuthFailure,
   friendlySyncError,
@@ -76,6 +76,8 @@ export const DEFAULT_CONTENT_BATCH_SIZE = 40;
 // The previous 30s client timeout was shorter than both, so the client
 // aborted mid-lease and retried into projection_busy. Default matches the lease.
 export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+/** Status checks have no projection work and must finish before upload deadlines. */
+export const DEFAULT_STATUS_TIMEOUT_MS = 20_000;
 export const CONTENT_BATCH_SIZE_MIN = 1;
 export const CONTENT_BATCH_SIZE_MAX = 500;
 export const REQUEST_TIMEOUT_MS_MIN = 5_000;
@@ -103,6 +105,8 @@ export const POISON_OP_REJECTION_THRESHOLD = 3;
 const MAX_POISON_QUARANTINES_PER_FLUSH = 25;
 /** Failure-streak ledger writes are throttled to one per interval. */
 const HEALTH_WRITE_THROTTLE_MS = 60 * 1_000;
+/** While work_state waits to sync, the hub's content kinds are re-read this often (shouldProbeContentKinds). */
+const CONTENT_KINDS_REPROBE_MS = 60 * 60 * 1_000;
 
 /**
  * Typed hub HTTP failure. Carries Retry-After so scheduleRetry can wait
@@ -284,6 +288,7 @@ const TABLE_BY_KIND: Record<RowKind, string> = {
   observation: 'observations',
   summary: 'session_summaries',
   prompt: 'user_prompts',
+  work_state: 'work_state_entries',
 };
 
 interface KindSpec {
@@ -422,6 +427,9 @@ const KINDS: KindSpec[] = [
     // `unknown` sentinel because canonical v2 requires it. session_db_id NEVER travels (a
     // device-local rowid, re-resolved on apply).
     //
+    // prompt_text is bounded at the SELECT, never after it: a pasted multi-MB
+    // prompt must not cross the FFI boundary in full (prompt-text-clamp.ts).
+    //
     // ACCEPTED LIMITATION (join-field drift): the body embeds JOINED session
     // fields, but the op's rev covers only the prompt row itself — a later
     // change to the owning session (e.g. a project remap) does not bump
@@ -431,8 +439,7 @@ const KINDS: KindSpec[] = [
     selectSql: `
       SELECT CAST(up.id AS TEXT) AS id, CAST(up.sync_rev AS TEXT) AS sync_rev,
         up.content_session_id AS content_session_id,
-        up.prompt_number AS prompt_number,
-        up.prompt_text AS prompt_text,
+        up.prompt_number AS prompt_number,${PROMPT_TEXT_COLUMNS_SQL},
         up.created_at AS created_at, up.created_at_epoch AS created_at_epoch,
         s.memory_session_id AS memory_session_id, s.project AS project,
         s.platform_source AS platform_source
@@ -442,8 +449,7 @@ const KINDS: KindSpec[] = [
     selectOneSql: `
       SELECT CAST(up.id AS TEXT) AS id, CAST(up.sync_rev AS TEXT) AS sync_rev,
         up.content_session_id AS content_session_id,
-        up.prompt_number AS prompt_number,
-        up.prompt_text AS prompt_text,
+        up.prompt_number AS prompt_number,${PROMPT_TEXT_COLUMNS_SQL},
         up.created_at AS created_at, up.created_at_epoch AS created_at_epoch,
         s.memory_session_id AS memory_session_id, s.project AS project,
         s.platform_source AS platform_source
@@ -452,12 +458,38 @@ const KINDS: KindSpec[] = [
     toBody: (r) => ({
       content_session_id: r.content_session_id ?? null,
       prompt_number: decimalPayload(r.prompt_number, 'prompt_number'),
-      prompt_text: r.prompt_text ?? null,
+      prompt_text: clampPromptTextForSync(r.prompt_text, r.prompt_text_head),
       created_at: r.created_at ?? null,
       created_at_epoch: decimalPayload(r.created_at_epoch, 'created_at_epoch'),
       memory_session_id: r.memory_session_id ?? null,
       project: r.project ?? 'unknown',
       platform_source: r.platform_source ?? null,
+    }),
+  },
+  {
+    kind: 'work_state',
+    localTable: 'work_state_entries',
+    // The agent's to-do lists and working state (sqlite/work-state.ts): an
+    // append-only log, so a row's first revision is normally its whole life.
+    // `fields` travels as the object it stores, like observation metadata.
+    // Pushed only to a hub whose status lists the kind (hubAcceptsKind).
+    selectSql: `
+      SELECT CAST(id AS TEXT) AS id, CAST(sync_rev AS TEXT) AS sync_rev,
+        project, list_name, fields, created_at, created_at_epoch
+      FROM work_state_entries
+      WHERE synced_at IS NULL AND origin_device_id IS NULL
+      ORDER BY id LIMIT ?`,
+    selectOneSql: `
+      SELECT CAST(id AS TEXT) AS id, CAST(sync_rev AS TEXT) AS sync_rev,
+        project, list_name, fields, created_at, created_at_epoch
+      FROM work_state_entries
+      WHERE id = ? AND origin_device_id IS NULL`,
+    toBody: (r) => ({
+      project: r.project ?? 'unknown',
+      list_name: r.list_name ?? null,
+      fields: jsonPayloadColumn(r.fields, 'fields', 'object'),
+      created_at: r.created_at ?? null,
+      created_at_epoch: decimalPayload(r.created_at_epoch, 'created_at_epoch'),
     }),
   },
 ];
@@ -494,8 +526,12 @@ export interface CloudSyncOptions {
   backoffMaxMs?: number;
   /** Per-request timeout — a hub POST can never hang the drain. Default 90s. */
   requestTimeoutMs?: number;
+  /** Deadline for the complete read-only status probe. Default 20s. */
+  statusTimeoutMs?: number;
   /** Re-check interval while paused on a 401/403. Default 1h. */
   authRetryMs?: number;
+  /** Re-read interval for the hub's content kinds while work_state waits. Default 1h. */
+  contentKindsReprobeMs?: number;
   /**
    * sync-health ledger path read by the SessionStart banner. null/omitted =
    * no ledger (tests, out-of-band callers); the worker passes the default.
@@ -506,8 +542,10 @@ export interface CloudSyncOptions {
 export interface CloudSyncStatus {
   configured: boolean;
   deviceId: string;
-  pending: { observations: number; summaries: number; prompts: number; mutations: number; tombstones: number };
+  pending: { observations: number; summaries: number; prompts: number; workState: number; mutations: number; tombstones: number };
   quarantine: { count: number; latestReason: string | null };
+  /** Pulled hub ops this device set aside because they can never apply here. */
+  pullQuarantine: { count: number; latestReason: string | null };
   lastFlushAt: number | null;
   lastError: string | null;
   /** Set while paused on a 401/403; cleared by a successful re-check. */
@@ -520,6 +558,8 @@ export interface CloudSyncStatus {
     epoch: string | null;
     headSeq: string | null;
     projectedSeq: string | null;
+    /** Kinds the hub accepts (`content_kinds`); [] for a hub that predates the field; null until probed. */
+    contentKinds: string[] | null;
     error: string | null;
   };
 }
@@ -538,7 +578,10 @@ export class CloudSync {
   private readonly backoffMaxMs: number;
   private readonly contentBatchSize: number;
   private readonly requestTimeoutMs: number;
+  private readonly statusTimeoutMs: number;
+  private statusProbePromise: Promise<void> | null = null;
   private readonly authRetryMs: number;
+  private readonly contentKindsReprobeMs: number;
   private readonly healthFilePath: string | null;
 
   /** '' when unconfigured or when device-id resolution failed closed. */
@@ -564,6 +607,7 @@ export class CloudSync {
     epoch: null,
     headSeq: null,
     projectedSeq: null,
+    contentKinds: null,
     error: null,
   };
   /** True while SyncClient's advisory socket is live (setFastDebounce). */
@@ -605,7 +649,9 @@ export class CloudSync {
     this.requestTimeoutMs = options.requestTimeoutMs ?? parseRequestTimeoutMs(
       settings.CLAUDE_MEM_CLOUD_SYNC_REQUEST_TIMEOUT_MS,
     );
+    this.statusTimeoutMs = options.statusTimeoutMs ?? DEFAULT_STATUS_TIMEOUT_MS;
     this.authRetryMs = options.authRetryMs ?? DEFAULT_AUTH_RETRY_MS;
+    this.contentKindsReprobeMs = options.contentKindsReprobeMs ?? CONTENT_KINDS_REPROBE_MS;
     this.healthFilePath = options.healthFilePath ?? null;
     this.nextBackoffMs = this.backoffInitialMs;
 
@@ -688,13 +734,7 @@ export class CloudSync {
         this.flushAgainRequested = true;
         return;
       }
-      if (this.debounceTimer) clearTimeout(this.debounceTimer);
-      const timer = setTimeout(() => {
-        this.debounceTimer = null;
-        void this.flush();
-      }, this.fastDebounce ? this.fastDebounceMs : this.debounceMs);
-      (timer as { unref?: () => void }).unref?.();
-      this.debounceTimer = timer;
+      this.armFlushTimer(this.fastDebounce ? this.fastDebounceMs : this.debounceMs);
     } catch (error) {
       // notify() is called from write paths — swallow everything.
       try {
@@ -733,9 +773,16 @@ export class CloudSync {
       this.dropStaleOriginDeviceIdSnapshots();
       do {
         this.flushAgainRequested = false;
+        // One status GET learns which kinds this hub accepts (hubAcceptsKind)
+        // before anything work_state is sent, saved snapshots included.
+        if (this.hasPendingWorkState() && this.shouldProbeContentKinds()) {
+          await this.probeHubStatus();
+          if (this.stopped) return;
+        }
         await this.drainContentOutbox();
         await this.drainMutations();
         for (const kind of KINDS) {
+          if (!this.hubAcceptsKind(kind.kind)) continue;
           await this.drainKind(kind);
         }
       } while (this.flushAgainRequested && !this.stopped);
@@ -744,6 +791,7 @@ export class CloudSync {
       this.lastError = null;
       this.recordFlushSuccess();
       this.resetBackoff();
+      this.scheduleContentKindsRecheck();
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       this.lastError = friendlySyncError(err.message);
@@ -775,10 +823,12 @@ export class CloudSync {
         observations: this.countPending('observations'),
         summaries: this.countPending('session_summaries'),
         prompts: this.countPending('user_prompts'),
+        workState: this.countPending('work_state_entries'),
         mutations: this.countPendingMutations(),
         tombstones: this.countPendingTombstones(),
       },
       quarantine: this.quarantineStatus(),
+      pullQuarantine: this.pullQuarantineStatus(),
       lastFlushAt: this.lastFlushAt,
       lastError: this.lastError,
       authError: this.authFailure
@@ -805,8 +855,10 @@ export class CloudSync {
     this.authFailure = failure;
     // The ladder is irrelevant while paused; start fresh after recovery.
     this.nextBackoffMs = this.backoffInitialMs;
+    // warn, not error: a rejected token or lapsed plan is an expected server
+    // answer, and logger.error would ship it to error tracking on every start.
     if (changed) {
-      logger.error('CLOUD_SYNC', 'Cloud sync paused: the sync server rejected this device\'s credentials', {
+      logger.warn('CLOUD_SYNC', 'Cloud sync paused: the sync server rejected this device\'s credentials', {
         code: failure.code,
         status: failure.status,
         recheckInMs: this.authRetryMs,
@@ -900,9 +952,73 @@ export class CloudSync {
     return this.status();
   }
 
-  private async probeHubStatus(): Promise<void> {
+  /**
+   * Content kinds the hub advertises in GET /v1/sync/status (`content_kinds`).
+   * A kind the hub has not listed is never pushed: its rows wait, unsynced, for
+   * a hub that accepts them. Without this an older hub would refuse the op by
+   * name and the poison-op threshold (#4086) would dead-letter the row for
+   * good. The three launch kinds predate the field and are always accepted.
+   */
+  private hubAcceptsKind(kind: ContentKind): boolean {
+    if (kind !== 'work_state') return true;
+    return this.hubStatus.contentKinds?.includes(kind) ?? false;
+  }
+
+  /**
+   * Ask the hub which kinds it accepts before pushing one it may not: when it
+   * has never been asked, and again once an hour whichever way it answered,
+   * since a hub can start or stop listing work_state at any time (a hub
+   * upgrade, a per-account server setting). Callers ask only while work_state
+   * is pending (hasPendingWorkState).
+   */
+  private shouldProbeContentKinds(): boolean {
+    if (this.hubStatus.contentKinds === null) return true;
+    return Date.now() - (this.hubStatus.checkedAt ?? 0) >= this.contentKindsReprobeMs;
+  }
+
+  /** work_state rows not yet acked, or saved work_state snapshots still in the outbox. */
+  private hasPendingWorkState(): boolean {
+    return this.countPending('work_state_entries') > 0
+      || this.db.prepare("SELECT 1 FROM sync_content_outbox WHERE kind = 'work_state' LIMIT 1").get() !== null;
+  }
+
+  /**
+   * An idle device runs no flush, so work_state waiting on a hub that does not
+   * list the kind would never be re-checked. After a successful flush that
+   * leaves work_state pending, arm the flush timer for the next hourly
+   * re-check; a write's notify() replaces it with its short debounce, and that
+   * flush arms it again.
+   */
+  private scheduleContentKindsRecheck(): void {
+    if (this.stopped || this.debounceTimer || this.retryTimer || !this.hasPendingWorkState()) return;
+    const sinceCheckMs = Date.now() - (this.hubStatus.checkedAt ?? 0);
+    this.armFlushTimer(Math.max(this.contentKindsReprobeMs - sinceCheckMs, 0));
+  }
+
+  /** The one pending-flush timer: notify()'s debounce or the hourly content-kinds re-check. */
+  private armFlushTimer(delayMs: number): void {
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    const timer = setTimeout(() => {
+      this.debounceTimer = null;
+      void this.flush();
+    }, delayMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.debounceTimer = timer;
+  }
+
+  private probeHubStatus(): Promise<void> {
+    if (!this.statusProbePromise) {
+      this.statusProbePromise = this.runHubStatusProbe().finally(() => {
+        this.statusProbePromise = null;
+      });
+    }
+    return this.statusProbePromise;
+  }
+
+  private async runHubStatusProbe(): Promise<void> {
     let checkedAt = Date.now();
     try {
+      const signal = AbortSignal.timeout(this.statusTimeoutMs);
       const response = await this.fetchImpl(`${this.hubUrl}/v1/sync/status`, {
         method: 'GET',
         headers: {
@@ -911,7 +1027,7 @@ export class CloudSync {
           'X-Device-Id': this.deviceId,
           ...(this.deviceName ? { 'X-Device-Name': this.deviceName } : {}),
         },
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+        signal,
       });
       checkedAt = Date.now();
       const syncMode = response.headers.get('X-Sync-Mode');
@@ -932,6 +1048,7 @@ export class CloudSync {
       try {
         parsed = await response.json();
       } catch {
+        if (signal.aborted) throw signal.reason;
         throw new Error('sync hub status: response is not JSON');
       }
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -954,12 +1071,17 @@ export class CloudSync {
       if (compareCanonicalDecimals(projectedSeq, headSeq) > 0) {
         throw new Error('sync hub status: projected_seq exceeds head_seq');
       }
+      // A hub that predates `content_kinds` accepts only the launch kinds.
+      const contentKinds = Array.isArray(record.content_kinds)
+        ? record.content_kinds.filter((kind): kind is string => typeof kind === 'string')
+        : [];
       this.hubStatus = {
         checkedAt,
         reachable: true,
         epoch,
         headSeq,
         projectedSeq,
+        contentKinds,
         error: null,
       };
       this.exitAuthPause();
@@ -971,11 +1093,13 @@ export class CloudSync {
       const raw = error instanceof Error ? friendlySyncError(error.message) : String(error);
       const safe = this.token === '' ? raw : raw.split(this.token).join('[REDACTED]');
       this.hubStatus = {
-        checkedAt,
+        checkedAt: Date.now(),
         reachable: false,
         epoch: null,
         headSeq: null,
         projectedSeq: null,
+        // What the hub accepted last time still holds; an outage changes nothing.
+        contentKinds: this.hubStatus.contentKinds,
         error: safe,
       };
     }
@@ -1059,14 +1183,20 @@ export class CloudSync {
   // Drain internals
   // -------------------------------------------------------------------------
 
-  /** Drain immutable live/delete/revive snapshots exactly as persisted. */
+  /**
+   * Drain immutable live/delete/revive snapshots exactly as persisted. A saved
+   * work_state snapshot (a push that failed after it was saved) waits like its
+   * row while the hub does not list the kind: sent anyway, a hub that refuses
+   * it by name would dead-letter it, and the append-only row with it.
+   */
   private async drainContentOutbox(): Promise<void> {
     for (;;) {
       if (this.stopped) return;
       const rows = this.db.prepare(`
         SELECT body, operation_sha256 FROM sync_content_outbox
+        WHERE kind != 'work_state' OR ? = 1
         ORDER BY deleted DESC, id LIMIT ?
-      `).all(this.contentBatchSize) as Array<CanonicalWireOp>;
+      `).all(this.hubAcceptsKind('work_state') ? 1 : 0, this.contentBatchSize) as Array<CanonicalWireOp>;
       if (rows.length === 0) return;
       let batch: WireOp[] = [];
       let bytes = 0;
@@ -1116,14 +1246,15 @@ export class CloudSync {
         bufBytes = 0;
       };
       for (const row of rows) {
+        let op: WireOp;
+        let isProjectRemap = false;
         try {
-          let op: WireOp;
           if (row.canonical_body !== null || row.operation_sha256 !== null) {
             if (row.canonical_body === null || row.operation_sha256 === null) {
               throw new Error('partial canonical mutation snapshot');
             }
             op = { body: row.canonical_body, operation_sha256: row.operation_sha256 };
-            parseCanonicalOperation(op);
+            isProjectRemap = parseCanonicalOperation(op).mutation?.op === 'remap_project';
           } else {
             let parsed: unknown;
             try {
@@ -1135,6 +1266,7 @@ export class CloudSync {
               throw new Error('mutation body must be an object');
             }
             const body = parsed as OpBody;
+            isProjectRemap = body.op === 'remap_project';
             if (body.op === 'set_prompt_session' && typeof body.target === 'object' && body.target !== null) {
               const target = body.target as Record<string, unknown>;
               if (target.origin_device_id == null) target.origin_device_id = this.deviceId;
@@ -1152,19 +1284,27 @@ export class CloudSync {
               WHERE id = ? AND canonical_body IS NULL AND operation_sha256 IS NULL
             `).run(op.body, op.operation_sha256, row.id);
           }
-          const size = Buffer.byteLength(JSON.stringify(op), 'utf8');
-          if (buf.length > 0 && (
-            pushRequestBytes(bufBytes + size, buf.length + 1) > MAX_BODY_BYTES
-            || buf.length >= MAX_OPS_PER_PUSH
-          )) {
-            await send();
-            if (this.stopped) return;
-          }
-          buf.push(op);
-          bufBytes += size;
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           this.quarantineMutation(row, reason);
+          continue;
+        }
+        const size = Buffer.byteLength(JSON.stringify(op), 'utf8');
+        // One project remap can rewrite thousands of server rows. Preserve
+        // queue order, but give each remap its own transaction/timeout budget.
+        if (buf.length > 0 && (
+          isProjectRemap
+          || pushRequestBytes(bufBytes + size, buf.length + 1) > MAX_BODY_BYTES
+          || buf.length >= MAX_OPS_PER_PUSH
+        )) {
+          await send();
+          if (this.stopped) return;
+        }
+        buf.push(op);
+        bufBytes += size;
+        if (isProjectRemap) {
+          await send();
+          if (this.stopped) return;
         }
       }
       await send();
@@ -1920,6 +2060,20 @@ export class CloudSync {
     }
   }
 
+  private pullQuarantineStatus(): { count: number; latestReason: string | null } {
+    try {
+      const count = (this.db.prepare(
+        'SELECT COUNT(*) AS n FROM sync_pull_quarantine'
+      ).get() as { n: number }).n;
+      const latest = this.db.prepare(
+        'SELECT reason FROM sync_pull_quarantine ORDER BY id DESC LIMIT 1'
+      ).get() as { reason: string } | undefined;
+      return { count, latestReason: latest?.reason ?? null };
+    } catch {
+      return { count: 0, latestReason: null }; // DB opened without SessionStore migrations
+    }
+  }
+
   private maxDecimal(values: string[]): string {
     let max = '0';
     for (const value of values) {
@@ -1992,7 +2146,8 @@ export class CloudSync {
 
   private scheduleRetry(minDelayMs = 0): void {
     if (this.stopped || this.retryTimer) return;
-    const delay = Math.max(minDelayMs, applyBackoffJitter(this.nextBackoffMs));
+    // Jitter the local ladder, never the minimum requested by the hub.
+    const delay = Math.max(applyBackoffJitter(this.nextBackoffMs), minDelayMs);
     this.nextBackoffMs = Math.min(this.nextBackoffMs * 2, this.backoffMaxMs);
     const timer = setTimeout(() => {
       this.retryTimer = null;
@@ -2039,18 +2194,11 @@ export class CloudSync {
 
   // Same read-mutate-write pattern as SettingsRoutes.handleUpdateSettings.
   private persistDeviceId(deviceId: string): void {
-    let settings: Record<string, unknown>;
-    if (existsSync(this.settingsPath)) {
-      settings = parseJsonWithBom<Record<string, unknown>>(readFileSync(this.settingsPath, 'utf-8'));
-    } else {
-      settings = { ...SettingsDefaultsManager.getAllDefaults() };
-    }
-    // Settings files are flat post-migration, but tolerate the legacy nested
-    // {env:{...}} shape rather than writing a mixed schema.
-    const target = settings.env && typeof settings.env === 'object'
-      ? settings.env as Record<string, unknown>
-      : settings;
-    target.CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID = deviceId;
-    writeJsonFileAtomic(this.settingsPath, settings);
+    const result = updateSettingsDocument(
+      this.settingsPath,
+      { CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID: deviceId },
+      SettingsDefaultsManager.getAllDefaults(),
+    );
+    if (result.status === 'refused') throw result.error instanceof Error ? result.error : new Error(String(result.error));
   }
 }
