@@ -438,17 +438,42 @@ export class RateLimitTracker {
   }
 
   /**
-   * Select the best available model from the cascade.
-   * If the preferred model has capacity, it is returned.
-   * If not (due to rate limits), dynamically cascades down to the next capable model.
+   * Get dynamic RPM pacing interval in ms for a model: (ceil(60 / rpmLimit) + 1) * 1000.
    */
-  public selectBestAvailableModel(preferredModel: string, estimatedTokens: number = 2000): {
+  public getDynamicPacingMs(modelId: string): number {
+    const registry = DynamicModelRegistry.getInstance();
+    const info = registry.getModel(modelId);
+    const limits = info ? getTierLimits(info, this.tier) : { rpmLimit: 15 };
+    const rpm = Math.max(1, limits.rpmLimit);
+    return (Math.ceil(60 / rpm) + 1) * 1000;
+  }
+
+  /**
+   * Remaining ms until the model clears its dynamic RPM pacing interval.
+   */
+  public getModelPacingWaitMs(modelId: string, now: number = Date.now()): number {
+    const timestamps = this.rpmTimestamps.get(modelId);
+    if (!timestamps || timestamps.length === 0) return 0;
+    const last = timestamps[timestamps.length - 1];
+    const pacingMs = this.getDynamicPacingMs(modelId);
+    const elapsed = now - last;
+    if (elapsed < pacingMs) {
+      return pacingMs - elapsed;
+    }
+    return 0;
+  }
+
+  /**
+   * Select the best available model from the cascade.
+   * If the preferred model has capacity and cleared pacing, it is returned.
+   * If not (due to rate limits, cooldown, or pacing), dynamically transborders to the next capable model.
+   */
+  public selectBestAvailableModel(preferredModel: string, estimatedTokens: number = 2000, now: number = Date.now()): {
     selectedModel: GeminiModelInfo;
     willFallback: boolean;
     waitMs: number;
     reason?: string;
   } {
-    const now = Date.now();
     const registry = DynamicModelRegistry.getInstance();
     const cascade = registry.getCascade();
 
@@ -473,40 +498,94 @@ export class RateLimitTracker {
     if (!isAuto && startIndex !== -1) {
       const candidate = cascade[startIndex];
       const check = this.canExecute(candidate.id, estimatedTokens, now);
-      if (check.allowed) {
-        return { selectedModel: candidate, willFallback: false, waitMs: 0 };
-      }
+      const pacingWait = this.getModelPacingWaitMs(candidate.id, now);
+
+      // If auto-fallback is disabled, we cannot transborder; execute if allowed, else wait
       if (!this.autoFallbackEnabled) {
+        if (check.allowed) {
+          return { selectedModel: candidate, willFallback: false, waitMs: 0 };
+        }
         return { selectedModel: candidate, willFallback: false, waitMs: check.waitMs, reason: check.reason };
+      }
+
+      // With auto-fallback enabled: if preferred model is fully ready and not pacing, use it immediately
+      if (check.allowed && pacingWait === 0) {
+        return { selectedModel: candidate, willFallback: false, waitMs: 0 };
       }
     }
 
-    // If auto-fallback is enabled, cascade through remaining models in rank order
+    // If auto-fallback is enabled (or auto mode):
+    // 1. Proactive Transbordo: search for any candidate with RPD available that is fully ready and idle (allowed + pacingWait === 0)
     if (this.autoFallbackEnabled || isAuto) {
       for (const candidate of cascade) {
         if (this.unsupportedModels.has(candidate.id)) continue;
+        const limits = getTierLimits(candidate, this.tier);
+        if (this.getRpdUsed(candidate.id) >= limits.rpdLimit) continue; // skip exhausted RPD
+
         const check = this.canExecute(candidate.id, estimatedTokens, now);
-        if (check.allowed) {
+        if (!check.allowed) continue;
+
+        const pacingWait = this.getModelPacingWaitMs(candidate.id, now);
+        if (pacingWait === 0) {
           const willFallback = candidate.id !== preferredModel;
           if (willFallback) {
-            logger.info('SDK', `Cascade routed request to ${candidate.id} (preferred: ${preferredModel})`);
+            logger.info('SDK', `Cascade/Transbordo routed request to ${candidate.id} (preferred: ${preferredModel})`);
           }
           return { selectedModel: candidate, willFallback, waitMs: 0 };
         }
       }
+
+      // 2. If no candidate is completely idle (pacingWait === 0), but candidates still have RPM capacity (check.allowed):
+      // Check preferred model first if allowed:
+      if (!isAuto && startIndex !== -1) {
+        const preferred = cascade[startIndex];
+        const check = this.canExecute(preferred.id, estimatedTokens, now);
+        if (check.allowed) {
+          return { selectedModel: preferred, willFallback: false, waitMs: 0 };
+        }
+      }
+
+      // Check any other candidate with RPD that is allowed:
+      for (const candidate of cascade) {
+        if (this.unsupportedModels.has(candidate.id)) continue;
+        const limits = getTierLimits(candidate, this.tier);
+        if (this.getRpdUsed(candidate.id) >= limits.rpdLimit) continue;
+
+        const check = this.canExecute(candidate.id, estimatedTokens, now);
+        if (check.allowed) {
+          return { selectedModel: candidate, willFallback: candidate.id !== preferredModel, waitMs: 0 };
+        }
+      }
     }
 
-    // If all models are currently constrained by sliding 60s windows,
-    // find the one with the shortest wait time
+    // 3. If all models with available RPD are currently constrained by sliding 60s windows or cooldowns,
+    // find the candidate with the shortest dynamic wait time
     let minWaitMs = Infinity;
     let bestCandidate: GeminiModelInfo | undefined;
+    let bestReason: string = 'Rate limit: waiting for quota capacity';
 
-    for (const candidate of candidates) {
+    // Prioritize candidates with available RPD
+    const candidatesWithRpd = candidates.filter(c => {
+      if (this.unsupportedModels.has(c.id)) return false;
+      const limits = getTierLimits(c, this.tier);
+      return this.getRpdUsed(c.id) < limits.rpdLimit;
+    });
+
+    const pool = candidatesWithRpd.length > 0 ? candidatesWithRpd : candidates;
+
+    for (const candidate of pool) {
       if (this.unsupportedModels.has(candidate.id)) continue;
       const check = this.canExecute(candidate.id, estimatedTokens, now);
-      if (check.waitMs < minWaitMs) {
-        minWaitMs = check.waitMs;
+      const pacingMs = this.getDynamicPacingMs(candidate.id);
+      // If model is blocked by RPM limit, cap the wait at its dynamic pacing interval (e.g. 5s)
+      const effectiveWait = check.reason?.includes('RPM')
+        ? Math.min(check.waitMs, pacingMs)
+        : check.waitMs;
+
+      if (effectiveWait < minWaitMs) {
+        minWaitMs = effectiveWait;
         bestCandidate = candidate;
+        bestReason = check.reason ?? 'all_rate_limited';
       }
     }
 
@@ -518,7 +597,7 @@ export class RateLimitTracker {
       selectedModel: bestCandidate,
       willFallback: bestCandidate.id !== preferredModel,
       waitMs: minWaitMs,
-      reason: 'all_rate_limited',
+      reason: bestReason,
     };
   }
 

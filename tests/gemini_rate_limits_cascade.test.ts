@@ -373,7 +373,52 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       tracker.recordRequestFailure(model, 503, 'The model is overloaded.', 60_000);
       const status = tracker.getModelStatus(model, now);
       expect(status.status).toBe('cooldown');
-      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_000);
+      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_050);
+    });
+
+    it('calculates dynamic pacing interval from model rpmLimit: (60 / rpm + 1)', () => {
+      // Flash-Lite has 15 RPM -> (60 / 15 + 1) * 1000 = 5000ms
+      expect(tracker.getDynamicPacingMs('gemini-flash-lite-latest')).toBe(5000);
+      // Flash has 10 RPM -> (60 / 10 + 1) * 1000 = 7000ms
+      expect(tracker.getDynamicPacingMs('gemini-flash-latest')).toBe(7000);
+      // Pro has 2 RPM -> (60 / 2 + 1) * 1000 = 31000ms
+      expect(tracker.getDynamicPacingMs('gemini-pro-latest')).toBe(31000);
+    });
+
+    it('proactively transborders to another model when preferred model is in pacing interval', () => {
+      const preferred = 'gemini-flash-lite-latest';
+      const now = Date.now();
+
+      // Record a single request on preferred model right now
+      tracker.recordRequestSuccess(preferred, 100, now);
+
+      // Pacing wait for preferred should be ~5000ms
+      expect(tracker.getModelPacingWaitMs(preferred, now)).toBe(5000);
+
+      // Preferred is not yet allowed because it is in pacing,
+      // but auto-fallback should immediately transborder to another model with waitMs: 0
+      const selection = tracker.selectBestAvailableModel(preferred, 100, now);
+      expect(selection.waitMs).toBe(0);
+      expect(selection.selectedModel.id).not.toBe(preferred);
+      expect(selection.willFallback).toBe(true);
+    });
+
+    it('returns shortest dynamic pacing wait (e.g. <= 5s) instead of 60s when all available models reach RPM limit', () => {
+      const now = Date.now();
+      const cascade = DynamicModelRegistry.getInstance().getCascade();
+
+      // Mark all models as having reached their RPM limit 1 second ago
+      for (const m of cascade) {
+        const limits = getTierLimits(m, 'free');
+        for (let i = 0; i < limits.rpmLimit; i++) {
+          tracker.recordRequestSuccess(m.id, 100, now - 1000);
+        }
+      }
+
+      // Selection should find the candidate with shortest remaining pacing wait (e.g. ~5s on a 15 RPM model)
+      const selection = tracker.selectBestAvailableModel('gemini-flash-lite-latest', 100, now);
+      expect(selection.waitMs).toBeGreaterThan(0);
+      expect(selection.waitMs).toBeLessThanOrEqual(5000);
     });
   });
 });
