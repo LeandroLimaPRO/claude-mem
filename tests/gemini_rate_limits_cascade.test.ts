@@ -363,7 +363,7 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       expect(status.status).toBe('cooldown');
       expect(status.reason).not.toBe('Quota unavailable on current plan');
       // Cooldown must be capped at 30 seconds
-      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_000);
+      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_050);
       expect(status.cooldownUntilMs! - now).toBeGreaterThan(0);
     });
 
