@@ -616,8 +616,8 @@ export class RateLimitTracker {
       lower.includes('overloaded') ||
       (status !== undefined && status >= 500 && status < 600 && lower.includes('service unavailable'))
     ) {
-      // HTTP 503: Model is overloaded on Google servers
-      cooldownMs = retryAfterMs ?? 60_000;
+      // HTTP 503: Model is overloaded on Google servers (cap transient cooldown at max 30s)
+      cooldownMs = Math.min(30_000, retryAfterMs ?? 30_000);
       this.cooldowns.set(modelId, { untilMs: now + cooldownMs, reason: 'Model overloaded (503)' });
       reason = 'Model overloaded (503)';
       logger.warn('SDK', `Model ${modelId} is overloaded (503), entering cooldown for ${Math.round(cooldownMs / 1000)}s`);
@@ -654,17 +654,17 @@ export class RateLimitTracker {
         this.persistRpd();
       }
       logger.warn('SDK', `Model ${modelId} reached daily quota (auto-calibrated RPD to ${this.rpdCounts[modelId]}). Cooldown until ${tomorrow.toISOString()}`);
-    } else if (lower.includes('quota exceeded') && (modelId.includes('pro') || lower.includes('billing'))) {
+    } else if (lower.includes('quota exceeded') && modelId.includes('pro') && lower.includes('billing') && !lower.includes('requests per minute') && !lower.includes('perminute')) {
       // Pro models on free key without billing
       this.cooldowns.set(modelId, { untilMs: now + 3600_000, reason: 'Quota unavailable on current plan' });
       reason = 'Quota unavailable on current plan';
       logger.warn('SDK', `Model ${modelId} quota unavailable on free tier; cooled down for 1h`);
     } else {
-      // Standard RPM or TPM 429
+      // Standard RPM or TPM 429 (cap transient cooldown at max 30s)
       if (retryAfterMs) {
-        cooldownMs = retryAfterMs;
+        cooldownMs = Math.min(30_000, retryAfterMs);
       } else {
-        cooldownMs = Math.min(60_000, Math.max(15_000, 60_000 - (now % 60_000)));
+        cooldownMs = Math.min(30_000, Math.max(5_000, 60_000 - (now % 60_000)));
       }
       this.cooldowns.set(modelId, { untilMs: now + cooldownMs, reason });
       logger.warn('SDK', `Model ${modelId} entered cooldown for ${(cooldownMs / 1000).toFixed(0)}s (${reason})`);

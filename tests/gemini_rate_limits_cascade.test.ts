@@ -345,5 +345,35 @@ describe('Gemini Dynamic Engine & Rate Limiter', () => {
       expect(tracker.getRpmUsed(modelB, now)).toBe(1);
       expect(tracker.getModelStatus(modelB, now).status).toBe('cooldown');
     });
+
+    it('does not apply 1-hour cooldown to Flash/Lite models when 429 message mentions billing, and caps cooldown at max 30s', () => {
+      const model = 'gemini-flash-lite-latest';
+      const body = JSON.stringify({
+        error: {
+          code: 429,
+          message: 'Quota exceeded for quota metric Generate Requests Per Minute. Please check your plan and billing details at https://console.cloud.google.com/billing.',
+          status: 'RESOURCE_EXHAUSTED',
+        },
+      });
+
+      const now = Date.now();
+      // Google passes retryAfterMs of 89000ms (89 seconds)
+      tracker.recordRequestFailure(model, 429, body, 89_000);
+      const status = tracker.getModelStatus(model, now);
+      expect(status.status).toBe('cooldown');
+      expect(status.reason).not.toBe('Quota unavailable on current plan');
+      // Cooldown must be capped at 30 seconds
+      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_000);
+      expect(status.cooldownUntilMs! - now).toBeGreaterThan(0);
+    });
+
+    it('caps HTTP 503 overload cooldown at max 30s', () => {
+      const model = 'gemini-3.1-flash-lite';
+      const now = Date.now();
+      tracker.recordRequestFailure(model, 503, 'The model is overloaded.', 60_000);
+      const status = tracker.getModelStatus(model, now);
+      expect(status.status).toBe('cooldown');
+      expect(status.cooldownUntilMs! - now).toBeLessThanOrEqual(30_000);
+    });
   });
 });
