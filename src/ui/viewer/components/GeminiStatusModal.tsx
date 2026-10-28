@@ -496,8 +496,17 @@ export function GeminiStatusModal({
               <div className="alert-pause-content">
                 <strong>Fila temporariamente em pausa preventiva</strong>
                 <p>
-                  Janela de requisição por minuto saturada. Retomando automaticamente em{' '}
-                  <span className="countdown-pill">{countdownSeconds}s</span> sem qualquer perda de dados.
+                  {countdownSeconds > 30 ? (
+                    <>
+                      Aguardando renovação de cota diária (RPD). Retomando automaticamente em{' '}
+                      <span className="countdown-pill">{countdownSeconds}s</span> sem qualquer perda de dados.
+                    </>
+                  ) : (
+                    <>
+                      Espaçamento dinâmico de RPM em andamento. Retomando automaticamente em{' '}
+                      <span className="countdown-pill">{countdownSeconds}s</span> sem qualquer perda de dados.
+                    </>
+                  )}
                 </p>
               </div>
             </div>
